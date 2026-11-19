@@ -301,7 +301,8 @@ class CardRowWidget(QtWidgets.QWidget):
         else:
             if self.container is self.win.sequence:
                 self._hint.setText('Возьмите карту из колоды (внизу) и выложите сюда,\n'
-                                   'или кликните по карте в колоде — она добавится в конец.')
+                                   'или кликните по карте в колоде — она добавится в конец.\n'
+                                   'Ctrl + колесо мыши — масштаб карт.')
                 self._hint.setStyleSheet('QLabel#rowHint { color: #9ca3af; font-size: 10pt; }')
             else:
                 self._hint.setText(self.hint_text or 'выложите карты в цикл')
@@ -339,6 +340,9 @@ class CardRowWidget(QtWidgets.QWidget):
     def minimumSizeHint(self):
         A, xs, gap_x = self._layout_positions()
         slot = self.sweep_role is not None
+        # карта с текущим масштабом (Ctrl+колесо, 0.2…1)
+        cw = int(round(CardView.W * self.win.zoom))
+        ch = int(round(CardView.H * self.win.zoom))
         if A:
             w = xs[-1] + self._view_width(A[-1]) + self.MARGIN_R
         elif self._views:
@@ -347,11 +351,11 @@ class CardRowWidget(QtWidgets.QWidget):
             # пустой отсек свипа — ровно слот под карту: подсказка шире карты
             # и не должна раздувать отсек (пустой и заполненный свипы одного
             # размера, растут только от добавленных карт)
-            w = self.MARGIN_L + CardView.W + self.MARGIN_R
+            w = self.MARGIN_L + cw + self.MARGIN_R
         else:
             w = max(self._hint.width() + 40, 420)
         if slot:
-            h = self.MARGIN_T + CardView.H + self.MARGIN_B
+            h = self.MARGIN_T + ch + self.MARGIN_B
         else:
             h = self.MARGIN_T + max(
                 [self._view_height(v) for v in self._views] or [self._hint.height() or 70]
@@ -460,11 +464,24 @@ class CardView(QtWidgets.QFrame):
 
     W, H = 150, 210
 
+    def view_size(self):
+        """Размер карты с учётом масштаба программы (win.zoom, 0.2…1):
+        рисунок в paintEvent строится в логических координатах W×H и
+        умножается на масштаб через p.scale — вместе с картой
+        уменьшаются и надписи на ней."""
+        z = getattr(self.win, 'zoom', 1.0)
+        return QtCore.QSize(int(round(self.W * z)), int(round(self.H * z)))
+
+    def apply_zoom(self):
+        """Новый масштаб: размер карты и перерисовка."""
+        self.setFixedSize(self.view_size())
+        self.update()
+
     def __init__(self, card, win):
         super().__init__()
         self.card = card
         self.win = win
-        self.setFixedSize(self.W, self.H)
+        self.setFixedSize(self.view_size())
         self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
         self.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self._menu)
@@ -473,10 +490,10 @@ class CardView(QtWidgets.QFrame):
     def minimumSizeHint(self):
         # без layout у paint-карты Qt вернул бы «пусто», и раскладчик
         # ставил бы карты вплотную — карты накладывались друг на друга
-        return QtCore.QSize(self.W, self.H)
+        return self.view_size()
 
     def sizeHint(self):
-        return QtCore.QSize(self.W, self.H)
+        return self.view_size()
 
     def refresh_style(self):
         self.update()
@@ -487,6 +504,8 @@ class CardView(QtWidgets.QFrame):
     def paintEvent(self, ev):
         p = QtGui.QPainter(self)
         p.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        z = getattr(self.win, 'zoom', 1.0)
+        p.scale(z, z)               # рисуем в логических координатах W×H
         w, h = self.W, self.H
         color = card_color(self.card)
         sel = self.win.is_selected(self.card.id)
@@ -630,6 +649,11 @@ class LoopView(QtWidgets.QFrame):
     def refresh_style(self):
         self.setStyleSheet(loop_qss(self.win.is_selected(self.loop.id)))
 
+    def apply_zoom(self):
+        # тело цикла считает размеры от minimumSizeHint карт —
+        # достаточно пересчитать геометрию
+        self.updateGeometry()
+
     def mousePressEvent(self, ev):
         if ev.button() == QtCore.Qt.MouseButton.LeftButton:
             self._press_pos = mouse_pos(ev)
@@ -745,9 +769,7 @@ class SweepView(QtWidgets.QFrame):
             row.hint_text = SWEEP_BAY_LABELS[role][1]
             # отсек вмещает карту целиком даже пустым: пустой и заполненный
             # свипы одного размера; дальше — только рост с добавлением карт
-            row.setMinimumSize(
-                CardRowWidget.MARGIN_L + CardView.W + CardRowWidget.MARGIN_R,
-                CardRowWidget.MARGIN_T + CardView.H + CardRowWidget.MARGIN_B)
+            row.setMinimumSize(*self._row_min_size())
             bv.addWidget(row, 1)
             bays.addWidget(bay, 1)
             self.rows[role] = row
@@ -769,6 +791,19 @@ class SweepView(QtWidgets.QFrame):
     @property
     def row_y(self):
         return self.rows['y']
+
+    def _row_min_size(self):
+        """Минимум отсека: одна карта текущего масштаба (пустой и
+        заполненный свипы одного размера)."""
+        z = self.win.zoom
+        return (int(round(CardRowWidget.MARGIN_L + CardView.W * z + CardRowWidget.MARGIN_R)),
+                int(round(CardRowWidget.MARGIN_T + CardView.H * z + CardRowWidget.MARGIN_B)))
+
+    def apply_zoom(self):
+        """Новый масштаб: минимум отсеков — под карту нового размера."""
+        for row in self.rows.values():
+            row.setMinimumSize(*self._row_min_size())
+        self.updateGeometry()
 
     def set_label(self):
         self.caption.setText('⟲ ' + sweep_label(self.sweep))
@@ -1246,6 +1281,9 @@ class RunReportDialog(QtWidgets.QDialog):
 
 
 class MainWindow(QtWidgets.QMainWindow):
+    # масштаб выложенных карт: Ctrl+колесо над лентой, 20 %…100 %
+    ZOOM_MIN, ZOOM_MAX, ZOOM_STEP = 0.2, 1.0, 0.1
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle('Программа проверки приборов — колода карт')
@@ -1265,6 +1303,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._completer_models = []   # модели подсказок (обновляются при правке констант)
         self._combo_editors = []      # редактируемые списки значений в параметрах
         self.log_messages = []      # (время, вид, текст) — вместо окна лога
+        self.zoom = 1.0             # масштаб выложенных карт (Ctrl+колесо, 0.2…1)
 
         self._log_bridge = LogBridge()
         self._log_bridge.sig.connect(self.append_log)
@@ -1392,17 +1431,43 @@ class MainWindow(QtWidgets.QMainWindow):
         return sa
 
     def eventFilter(self, obj, ev):
-        # колесо мыши над лентой/колодой → горизонтальная прокрутка
+        # колесо мыши над лентой/колодой → горизонтальная прокрутка;
+        # Ctrl+колесо над лентой → масштаб выложенных карт (0.2…1)
         if (ev.type() == QtCore.QEvent.Type.Wheel
                 and obj in getattr(self, '_wheel_viewports', {})):
             sa = self._wheel_viewports[obj]
+            d = ev.angleDelta().y() or ev.angleDelta().x()
+            if (sa is self._strip_area
+                    and ev.modifiers() & QtCore.Qt.KeyboardModifier.ControlModifier):
+                if d:
+                    self.set_zoom(self.zoom + self.ZOOM_STEP * (1 if d > 0 else -1))
+                ev.accept()
+                return True
             sb = sa.horizontalScrollBar()
-            d = ev.angleDelta().x() or ev.angleDelta().y()
             if d and sb.maximum() > 0:
                 sb.setValue(sb.value() - int(d))
                 ev.accept()
                 return True
         return super().eventFilter(obj, ev)
+
+    def set_zoom(self, z):
+        """Масштаб выложенных карт (Ctrl+колесо над лентой): 0.2…1.
+
+        Меняется размер только карт на ленте/в циклах/свипах — каркас окна,
+        панели и колода остаются прежними, чтобы программа целиком была
+        видна. Во время перетаскивания карты масштаб не применяется.
+        """
+        if self._mdrag is not None:
+            return
+        z = max(self.ZOOM_MIN, min(self.ZOOM_MAX, round(z, 2)))
+        if abs(z - self.zoom) < 1e-6:
+            return
+        self.zoom = z
+        for v in self.views.values():
+            v.apply_zoom()
+        for r in self._rows:
+            r.relayout()
+        self.status.setText(f'Масштаб программы: {int(round(z * 100))}%')
 
     def _build_connection_panel(self):
         """Панель подключения (модель + порт под каждый прибор) — слева."""
@@ -1518,6 +1583,10 @@ class MainWindow(QtWidgets.QMainWindow):
     def _build_status(self):
         self.status = QtWidgets.QLabel('Готово')
         self.statusBar().addWidget(self.status, 1)
+        # постоянная подсказка про масштаб — слева от «Пуск»
+        hint = QtWidgets.QLabel('Ctrl + колесо мыши — масштаб карт')
+        hint.setStyleSheet('color: #9ca3af;')
+        self.statusBar().addPermanentWidget(hint)
         # Пуск — в правом нижнем углу окна
         self.run_btn = QtWidgets.QPushButton('▶ Пуск')
         self.run_btn.setFixedSize(120, 30)
@@ -1748,9 +1817,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if self.running or self._mdrag is not None:
             return
         offset = press_global - btn.mapToGlobal(QtCore.QPoint(0, 0))
-        offset = QtCore.QPoint(min(max(offset.x(), 0), CardView.W),
-                               min(max(offset.y(), 0), CardView.H))
         pm = btn._drag_pixmap()
+        offset = QtCore.QPoint(min(max(offset.x(), 0), pm.width()),
+                               min(max(offset.y(), 0), pm.height()))
         state = {'kind': 'new', 'card_type': card_type, 'device': device,
                  'is_loop': False, 'pm_orig': pm,
                  'ghost': self._make_ghost(pm, press_global, offset),
