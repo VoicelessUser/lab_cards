@@ -6,7 +6,7 @@ Set/Meas в одну карту с выбором режима) мигрирую
 """
 import json
 
-from .cards import Card, ForLoop, CATALOG
+from .cards import Card, ForLoop, SweepCard, CATALOG
 
 # миграция карт старых версий -> (новый тип, параметры)
 _LEGACY = {
@@ -52,7 +52,16 @@ def _dump(it):
             'target_id': it.target_id,
             'children': [_dump(c) for c in it.children],
         }
-    return {'card': it.type, 'params': dict(it.params)}
+    if isinstance(it, SweepCard):
+        return {
+            'sweep_card': True,
+            'start': it.start, 'stop': it.stop, 'step': it.step,
+            'x': [_dump(c) for c in it.x_cards],
+            'mid': [_dump(c) for c in it.mid_cards],
+            'y': [_dump(c) for c in it.y_cards],
+        }
+    # id карты сохраняем: на него ссылается target_id свипа
+    return {'card': it.type, 'params': dict(it.params), 'id': it.id}
 
 
 def _load(it):
@@ -66,13 +75,24 @@ def _load(it):
             step=it.get('step', '1'), target_id=it.get('target_id', ''),
             children=[_load(c) for c in it.get('children', [])],
         )
+    if 'sweep_card' in it:
+        return SweepCard(
+            start=it.get('start', '1'), stop=it.get('stop', '5'),
+            step=it.get('step', '1'),
+            x_cards=[_load(c) for c in it.get('x', [])],
+            mid_cards=[_load(c) for c in it.get('mid', [])],
+            y_cards=[_load(c) for c in it.get('y', [])],
+        )
     t = it.get('card')
     params = dict(it.get('params', {}))
     if t in _LEGACY:                 # карта старой версии
         t, params = _LEGACY[t](params)
     if t not in CATALOG:
         raise ValueError(f'Неизвестный тип карты: {t}')
-    return Card(t, params)
+    card = Card(t, params)
+    if it.get('id'):                 # id из файла (в старых файлах его нет)
+        card.id = str(it['id'])
+    return card
 
 
 def load_program(path):

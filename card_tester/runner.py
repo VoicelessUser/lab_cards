@@ -3,9 +3,15 @@
 
 execute_program() — чистая логика (тестируется без GUI): подключает приборы
 lib_visa, идёт по программе слева направо, разворачивает циклы. Свипирование
-(цикл mode='sweep') автоматически управляет всеми Set-картами внутри себя:
-на каждой точке подставляет значение в их поле value и передаёт точку
-в on_meas для графика.
+(цикл mode='sweep') ведёт свою Set-карту: на каждой точке подставляет значение
+в её поле value. Карты раздаёт resolve_sweeps() (см. cards.py): вложенный свип
+забирает свою карту первым, внешний — первую свободную; если карта ведомаого
+внешним свипом лежит внутри вложенного, значение подставляет сам внешний свип,
+а вложенные эту карту пропускают. Свип-карта (SweepCard) работает так же, но
+её переменная — Set-карта отсека X, а измерения — Meas-карты отсека Y (каждая
+— своя линия на графике); карты середины выполняются на каждой точке. Точка
+уходит в on_meas с номером уровня — порядковый номер работающего свипа
+(sweep_units, 0 — первый): у каждого свипа свой график; свипов нет — точек нет.
 
 RunThread / IdnThread — обёртки в QThread для GUI.
 """
@@ -13,8 +19,9 @@ import time
 from datetime import datetime
 
 from .qt import QtCore, Signal
-from .cards import (Card, ForLoop, substitute, describe, loop_label,
-                    used_groups, collect_set_cards, CATALOG)
+from .cards import (Card, ForLoop, SweepCard, substitute, describe, loop_label,
+                    used_groups, collect_set_cards, own_level_set_cards,
+                    resolve_sweeps, sweep_units, x_set_card, CATALOG)
 
 PS_MODELS = ['DP832A', 'NGE100', 'AKIP1143', 'TH6400']
 MM_MODELS = ['DM3068', 'AKIP2101', 'SDM3045X']
@@ -137,6 +144,13 @@ def do_action(card, ctx):
 
 
 def exec_card(card, ctx, depth):
+    # Set-карту ведёт конкретный свип: внутри чужого свипа она не выполняется
+    # (иначе вложенный свип перезаписал бы переменную внешнего своим статичным
+    # значением). Своя карта применяется самим свипом (см. run_loop).
+    owner = ctx.card_owner.get(card.id)
+    if owner is not None and (not ctx.sweep_stack
+                              or ctx.sweep_stack[-1][0] != owner):
+        return
     ind = '  ' * depth
     ctx.steps += 1
     line = f'{ind}Шаг {ctx.steps}: {describe(card, ctx.vars)}'
@@ -153,10 +167,12 @@ def exec_card(card, ctx, depth):
         # каждая Meas-карта попадает в отчёт (время замера + значение)
         if ctx.on_result:
             ctx.on_result(describe(card, ctx.vars), result, stamp)
-        # точка для графика: если идёт свипирование
+        # точка для графика: если идёт свипирование — ближайшего уровня;
+        # уровень — порядковый номер работающего свипа (0 — первый),
+        # у каждого свипа свой график
         if value is not None and ctx.sweep_stack and ctx.on_meas:
-            var, x = ctx.sweep_stack[-1]
-            ctx.on_meas(var, x, describe(card, ctx.vars), value)
+            _owner, var, x, level = ctx.sweep_stack[-1]
+            ctx.on_meas(level, var, x, describe(card, ctx.vars), value)
     else:
         ctx.log(line, 'info')
 
@@ -198,32 +214,37 @@ def run_loop(loop, ctx, depth):
         return
 
     if loop.mode == 'sweep':
-        set_cards = collect_set_cards(loop.children)
-        if not set_cards:
-            ctx.log(f'{ind}⟳ Свип недоступен: внутри нет Set-карт — пропущен', 'warn')
-            return
-        # свип ведёт выбранную в настройках цикла Set-карту;
-        # если выбор не сделан, а Set-карта одна — берём её
-        target = next((c for c in set_cards if c.id == loop.target_id), None)
+        # переменная свипа — из раздачи resolve_sweeps(): свободная Set-карта
+        # поддерева (явный выбор в настройках имеет приоритет)
+        target = ctx.sweep_owners.get(loop.id)
         if target is None:
-            if len(set_cards) == 1:
-                target = set_cards[0]
+            if not collect_set_cards(loop.children):
+                ctx.log(f'{ind}⟳ Свип недоступен: внутри нет Set-карт — пропущен',
+                        'warn')
             else:
-                ctx.log(f'{ind}⟳ Свип: выберите Set-карту в настройках цикла '
-                        f'(Set-карт: {len(set_cards)}) — пропущен', 'warn')
-                return
+                ctx.log(f'{ind}⟳ Свип недоступен: все Set-карты внутри уже ведут '
+                        f'вложенные свипы — пропущен', 'warn')
+            return
         vals = loop_values(loop)
         x_name = _sweep_x_label([target])
+        # карта цели может лежать глубже (внутри вложенного свипа) — тогда
+        # значение подставляет сам этот свип, а вложенные её пропускают
+        in_body = any(c.id == target.id
+                      for c in own_level_set_cards(loop.children))
+        note = '' if in_body else ' (карта внутри вложенного свипа)'
         ctx.log(f'{ind}⟳ СВИП {loop.start} → {loop.stop}, шаг {loop.step} — '
-                f'{len(vals)} точек · {describe(target)}', 'loop')
-        ctx.sweep_stack.append((x_name, vals[0] if vals else 0.0))
+                f'{len(vals)} точек · {describe(target)}{note}', 'loop')
+        level = ctx.sweep_levels.get(loop.id, 0)
+        ctx.sweep_stack.append((loop.id, x_name, vals[0] if vals else 0.0, level))
         try:
             for i, val in enumerate(vals, 1):
                 if ctx.should_stop():
                     raise StopRun()
-                ctx.sweep_stack[-1] = (x_name, val)
+                ctx.sweep_stack[-1] = (loop.id, x_name, val, level)
                 target.params['value'] = f'{val:g}'
                 ctx.log(f'{ind}— точка {i}/{len(vals)}: {val:g}', 'loop')
+                if not in_body:
+                    exec_card(target, ctx, depth + 1)   # применить переменную
                 run_items(loop.children, ctx, depth + 1)
         finally:
             if ctx.sweep_stack:
@@ -241,12 +262,46 @@ def run_loop(loop, ctx, depth):
         run_items(loop.children, ctx, depth + 1)
 
 
+def run_sweep_card(sweep, ctx, depth):
+    """Свип-карта: X — свипируемая Set-карта, середина — карты каждой точки,
+    Y — Meas-карты (каждая — своя линия на графике этого свипа)."""
+    ind = '  ' * depth
+    x_card = x_set_card(sweep)
+    if x_card is None:
+        ctx.log(f'{ind}⟲ Свип пропущен: в отсеке X нет Set-карты', 'warn')
+        return
+    y_cards = [c for c in sweep.y_cards
+               if isinstance(c, Card) and c.type == 'meas']
+    vals = loop_values(sweep)
+    x_name = _sweep_x_label([x_card])
+    ctx.log(f'{ind}⟲ СВИП {sweep.start} → {sweep.stop}, шаг {sweep.step} — '
+            f'{len(vals)} точек · {describe(x_card)} · линий Y: {len(y_cards)}',
+            'loop')
+    level = ctx.sweep_levels.get(sweep.id, 0)
+    ctx.sweep_stack.append((sweep.id, x_name, vals[0] if vals else 0.0, level))
+    try:
+        for i, val in enumerate(vals, 1):
+            if ctx.should_stop():
+                raise StopRun()
+            ctx.sweep_stack[-1] = (sweep.id, x_name, val, level)
+            x_card.params['value'] = f'{val:g}'
+            ctx.log(f'{ind}— точка {i}/{len(vals)}: {val:g}', 'loop')
+            exec_card(x_card, ctx, depth + 1)      # применить переменную
+            run_items(sweep.mid_cards, ctx, depth + 1)
+            run_items(sweep.y_cards, ctx, depth + 1)
+    finally:
+        if ctx.sweep_stack:
+            ctx.sweep_stack.pop()
+
+
 def run_items(items, ctx, depth=0):
     for it in items:
         if ctx.should_stop():
             raise StopRun()
         if isinstance(it, ForLoop):
             run_loop(it, ctx, depth)
+        elif isinstance(it, SweepCard):
+            run_sweep_card(it, ctx, depth)
         elif isinstance(it, Card):
             exec_card(it, ctx, depth)
 
@@ -259,8 +314,11 @@ class RunContext:
         self.should_stop = should_stop
         self.vars = dict(vars or {})   # константы (для подстановки в поля)
         self.steps = 0
-        self.sweep_stack = []          # [(подпись оси X, значение)]
-        self.on_meas = on_meas         # callback(имя_оси, x, подпись, y) — свип
+        self.sweep_stack = []          # [(id свипа, подпись оси X, значение, уровень)]
+        self.sweep_levels = {}         # id свипа (цикл или карта) -> номер графика          # [(loop.id, подпись оси X, значение)]
+        self.sweep_owners = {}         # loop.id -> Set-карта (resolve_sweeps)
+        self.card_owner = {}           # card.id -> loop.id (защита от перезаписи)
+        self.on_meas = on_meas         # callback(уровень, имя_оси, x, подпись, y) — свип
         self.on_result = on_result     # callback(описание, текст, время) — все Meas
 
 
@@ -269,8 +327,9 @@ def execute_program(sequence, settings, log, should_stop, constants=None,
     """Подключает нужные приборы, выполняет программу, гарантированно отключает.
 
     constants — словарь общих констант {имя: значение}, доступны в полях карт.
-    on_meas — callback(имя_оси, x, подпись_измерения, y): вызывается для каждой
-    Meas-карты внутри цикла-диапазона (данные для графика).
+    on_meas — callback(уровень, имя_оси, x, подпись_измерения, y): вызывается
+    для каждой Meas-карты внутри цикла-диапазона (данные для графика; уровень —
+    номер объемлющего свипа, 0 — внешний).
     on_result — callback(описание, значение_текстом, время): вызывается для
     КАЖДОЙ Meas-карты (данные для отчёта).
     Возвращает True при полном прохождении без ошибок.
@@ -278,6 +337,11 @@ def execute_program(sequence, settings, log, should_stop, constants=None,
     devices = {}
     ctx = RunContext(devices, log, should_stop, vars=constants,
                      on_meas=on_meas, on_result=on_result)
+    owners = resolve_sweeps(sequence)
+    ctx.sweep_owners = owners
+    ctx.sweep_levels = {uid: i for i, (_kind, uid) in enumerate(sweep_units(sequence))}
+    ctx.card_owner = {c.id: loop_id for loop_id, c in owners.items()
+                      if c is not None}
     ok = False
     try:
         groups = used_groups(sequence)
@@ -320,7 +384,7 @@ class RunThread(QtCore.QThread):
     """Выполнение программы в отдельном потоке (UI не блокируется)."""
     sig_log = Signal(str, str)                  # текст, вид (в статусную строку)
     sig_done = Signal(bool, str)                # ok, сообщение
-    sig_point = Signal(str, str, float, float)  # имя оси X, подпись, x, y
+    sig_point = Signal(int, str, str, float, float)  # уровень свипа, ось X, подпись, x, y
     sig_meas = Signal(str, str, str)            # описание, значение, время
 
     def __init__(self, sequence, settings, constants=None, parent=None):
@@ -335,7 +399,7 @@ class RunThread(QtCore.QThread):
 
     def run(self):
         log = lambda text, kind='info': self.sig_log.emit(text, kind)
-        on_meas = lambda var, x, label, y: self.sig_point.emit(var, label, x, y)
+        on_meas = lambda level, var, x, label, y: self.sig_point.emit(level, var, label, x, y)
         on_result = lambda label, text, stamp: self.sig_meas.emit(label, text, stamp)
         try:
             ok = execute_program(self.sequence, self.settings, log,

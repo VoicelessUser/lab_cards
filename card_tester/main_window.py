@@ -5,7 +5,9 @@
 она летит за курсором, место вставки подсвечивается линией, соседние карты
 разъезжаются; «выкладываешь» на ленту или в цикл. Всплывающих окон нет —
 настройки карты и цикла всегда справа. Лог-окна нет: во время запуска
-пользователь видит график свипа и последнюю строку статуса.
+пользователь видит графики свипов (свой на каждый уровень) и последнюю
+строку статуса. Циклы вкладываются друг в друга — каждый свип ведёт свою
+Set-карту (цикл в цикле = уровни свипирования).
 """
 import copy
 import csv
@@ -16,9 +18,11 @@ from datetime import datetime
 
 from .qt import (QtCore, QtGui, QtWidgets, Signal,
                  QAction, QShortcut, mouse_pos)
-from .cards import (Card, ForLoop, CATALOG, C_LOOP, DEVICE_LABELS,
+from .cards import (Card, ForLoop, SweepCard, CATALOG, C_LOOP, DEVICE_LABELS,
                     new_card, describe, summarize, loop_label, find_container,
-                    remove_items, expand_on_off_pairs, collect_set_cards,
+                    remove_items, expand_on_off_pairs, sweep_candidates,
+                    collect_set_cards, count_sweeps, subtree_has_container,
+                    sweep_units, sweep_label, x_set_card, sweep_bays,
                     card_color, card_device_label, card_icon,
                     meas_kind_options, stats_rows)
 from .runner import RunThread, IdnThread, PS_MODELS, MM_MODELS
@@ -93,7 +97,8 @@ def paint_instrument_art(p, r, device):
             ручки регулировки, клеммы;
     'mm'  — мультиметр: вертикальный корпус, крупный дисплей, диск
             переключения, гнёзда щупов;
-    'sys' — песочные часы (Delay).
+    'sys' — песочные часы (Delay);
+    'sweep' — мини-график: оси, точки и кривая свипа (Свип).
     """
     rx, ry, rw, rh = r.x(), r.y(), r.width(), r.height()
     if device == 'ps':
@@ -182,6 +187,24 @@ def paint_instrument_art(p, r, device):
             p.drawEllipse(QtCore.QPointF(body.x() + body.width() * tx,
                                          body.y() + body.height() * 0.88),
                           body.width() * 0.06, body.width() * 0.06)
+    elif device == 'sweep':   # мини-график: оси и кривая свипа с точками
+        ax0 = QtCore.QPointF(rx + rw * 0.14, ry + rh * 0.14)
+        ax1 = QtCore.QPointF(rx + rw * 0.14, ry + rh * 0.84)
+        ax2 = QtCore.QPointF(rx + rw * 0.90, ry + rh * 0.84)
+        p.setPen(QtGui.QPen(QtGui.QColor('#4C566A'), 1.6))
+        p.drawLine(ax0, ax1)
+        p.drawLine(ax1, ax2)
+        pts = [QtCore.QPointF(ax1.x() + (ax2.x() - ax1.x()) * (i / 5.0),
+                              ax1.y() - (ax1.y() - ax0.y()) *
+                              (0.12 + 0.68 * (i / 5.0) ** 1.6))
+               for i in range(6)]
+        curve = QtGui.QPolygonF(pts)
+        p.setPen(QtGui.QPen(QtGui.QColor('#F5B301'), 2))
+        p.drawPolyline(curve)
+        p.setPen(QtGui.QPen(QtGui.QColor('#b45309'), 1.2))
+        p.setBrush(QtGui.QBrush(QtGui.QColor('#b45309')))
+        for q in pts:
+            p.drawEllipse(q, 2.4, 2.4)
     else:  # 'sys' — песочные часы
         p.setPen(QtGui.QPen(QtGui.QColor('#4C566A'), 2))
         p.setBrush(QtGui.QColor('#4C566A'))
@@ -244,7 +267,9 @@ class CardRowWidget(QtWidgets.QWidget):
     def __init__(self, win, container):
         super().__init__()
         self.win = win
-        self.container = container          # список модели: sequence или loop.children
+        self.container = container          # список модели: sequence, loop.children,
+        self.hint_text = None               # свой текст подсказки пустой строки
+        self.sweep_role = None              # 'x'/'mid'/'y' — отсек свип-карты
         self._views = []
         self._drag_view = None              # перетаскиваемая карта (исключается)
         self._drag_index = None             # индекс прорези в этой строке
@@ -277,8 +302,9 @@ class CardRowWidget(QtWidgets.QWidget):
             if self.container is self.win.sequence:
                 self._hint.setText('Возьмите карту из колоды (внизу) и выложите сюда,\n'
                                    'или кликните по карте в колоде — она добавится в конец.')
+                self._hint.setStyleSheet('QLabel#rowHint { color: #9ca3af; font-size: 10pt; }')
             else:
-                self._hint.setText('выложите карты в цикл')
+                self._hint.setText(self.hint_text or 'выложите карты в цикл')
                 self._hint.setStyleSheet('QLabel#rowHint { color: #A16207; font-size: 10pt; }')
             self._hint.adjustSize()
             self._hint.move(self.MARGIN_L + 4, self.MARGIN_T)
@@ -312,18 +338,34 @@ class CardRowWidget(QtWidgets.QWidget):
 
     def minimumSizeHint(self):
         A, xs, gap_x = self._layout_positions()
+        slot = self.sweep_role is not None
         if A:
             w = xs[-1] + self._view_width(A[-1]) + self.MARGIN_R
         elif self._views:
             w = self.MARGIN_L + self._view_width(self._views[0]) + self.MARGIN_R
+        elif slot:
+            # пустой отсек свипа — ровно слот под карту: подсказка шире карты
+            # и не должна раздувать отсек (пустой и заполненный свипы одного
+            # размера, растут только от добавленных карт)
+            w = self.MARGIN_L + CardView.W + self.MARGIN_R
         else:
             w = max(self._hint.width() + 40, 420)
-        h = self.MARGIN_T + max(
-            [self._view_height(v) for v in self._views] or [self._hint.height() or 70]
-        ) + self.MARGIN_B
+        if slot:
+            h = self.MARGIN_T + CardView.H + self.MARGIN_B
+        else:
+            h = self.MARGIN_T + max(
+                [self._view_height(v) for v in self._views] or [self._hint.height() or 70]
+            ) + self.MARGIN_B
         if gap_x is not None:
             w += self.GAP
-        return QtCore.QSize(w, h)
+        ms = self.minimumSize()          # явный минимум (отсек свипа — под карту)
+        return QtCore.QSize(max(w, ms.width()), max(h, ms.height()))
+
+    def sizeHint(self):
+        # без своего sizeHint Qt у layout'а родителя берёт minimumSizeHint
+        # «как есть» — отдаём тот же (клэмпленный) минимум, иначе пустой
+        # отсек свипа выходит шире заполненного
+        return self.minimumSizeHint()
 
     def relayout(self, animate=False):
         A, xs, gap_x = self._layout_positions()
@@ -342,6 +384,10 @@ class CardRowWidget(QtWidgets.QWidget):
                 an.setEasingCurve(QtCore.QEasingCurve.Type.OutCubic)
                 an.start()
                 self._anims.append(an)
+        # в отсеке свипа подсказка пустой строки — по центру (отсек высокий)
+        if self.sweep_role:
+            self._hint.move(max(0, (self.width() - self._hint.width()) // 2),
+                            max(0, (self.height() - self._hint.height()) // 2))
         self._update_indicator()
         # лента (верхний уровень): сообщаем scrollarea, что минимальный
         # размер изменился — иначе она «залипает» на ширине окна и колесу
@@ -626,13 +672,157 @@ class LoopView(QtWidgets.QFrame):
         m.exec(self.mapToGlobal(pos))
 
 
+# ---------------------------------------------------------------- свип-карта
+def sweep_qss(selected):
+    """Свип-карта: жёлтая зона с тремя отсеками (X / середина / Y).
+
+    Рамка всегда 3px (меняется только цвет): толщина рамки раздувает
+    минимальный размер layout'а, и свипы «дышали» бы при выделении.
+    """
+    border = '3px solid #F5B301' if selected else '3px solid #E3A008'
+    top = '#FFF7DB' if not selected else '#FFFBEB'
+    bottom = '#FFC940' if not selected else '#FFD75E'
+    return f"""
+    QFrame#sweepFrame {{
+        background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+            stop:0 {top}, stop:1 {bottom});
+        border: {border}; border-radius: 12px; }}
+    QLabel#sweepCaption {{ color: #7A5200; font-weight: bold; font-size: 7pt;
+        border: none; background: transparent; }}
+    QFrame#sweepBay {{ background: rgba(255, 255, 255, 120);
+        border: 1px solid #E3A008; border-radius: 8px; }}
+    QLabel#sweepBayLabel {{ color: #7A5200; font-weight: bold; font-size: 7pt;
+        border: none; background: transparent; }}
+    """
+
+
+# подписи отсков: роль -> (заголовок, подсказка пустого отсека)
+SWEEP_BAY_LABELS = {
+    'x': ('X · свипируемая величина', 'одна\nSet-карта (ось X)'),
+    'mid': ('любые карты', 'выполняются\nна каждой точке'),
+    'y': ('Y · измерения', 'Meas-карты:\nлиния на каждую'),
+}
+
+
+class SweepView(QtWidgets.QFrame):
+    """Свип-карта: жёлтая зона с тремя отсеками-строками.
+
+    Слева X — одна Set-карта, посередине — любые карты, справа Y — Meas-карты.
+    Клик по зоне (и по пустому отсеку) — настройки свипа справа; клики по
+    картам работают как обычно. Отсеки растут вместе с картами.
+    """
+
+    def __init__(self, sweep, win):
+        super().__init__()
+        self.sweep = sweep
+        self.win = win
+        self.setObjectName('sweepFrame')
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(9, 4, 9, 7)
+        lay.setSpacing(3)
+        self.caption = QtWidgets.QLabel('⟲ ' + sweep_label(sweep))
+        self.caption.setObjectName('sweepCaption')
+        # фикс-высоты подписей: пустой и заполненный свипы обязаны быть
+        # одного размера, а метрика шрифта из таблицы стилей зависит от
+        # момента её применения
+        self.caption.setFixedHeight(16)
+        lay.addWidget(self.caption)
+        bays = QtWidgets.QHBoxLayout()
+        bays.setSpacing(6)
+        self.rows = {}                     # роль -> CardRowWidget
+        for role, lst in sweep_bays(sweep):
+            bay = QtWidgets.QFrame()
+            bay.setObjectName('sweepBay')
+            bv = QtWidgets.QVBoxLayout(bay)
+            bv.setContentsMargins(6, 3, 6, 5)
+            bv.setSpacing(2)
+            lab = QtWidgets.QLabel(SWEEP_BAY_LABELS[role][0])
+            lab.setObjectName('sweepBayLabel')
+            lab.setFixedHeight(14)
+            bv.addWidget(lab)
+            row = CardRowWidget(win, lst)
+            row.sweep_role = role
+            row.hint_text = SWEEP_BAY_LABELS[role][1]
+            # отсек вмещает карту целиком даже пустым: пустой и заполненный
+            # свипы одного размера; дальше — только рост с добавлением карт
+            row.setMinimumSize(
+                CardRowWidget.MARGIN_L + CardView.W + CardRowWidget.MARGIN_R,
+                CardRowWidget.MARGIN_T + CardView.H + CardRowWidget.MARGIN_B)
+            bv.addWidget(row, 1)
+            bays.addWidget(bay, 1)
+            self.rows[role] = row
+        lay.addLayout(bays, 1)
+        self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._menu)
+        self._press_pos = None
+        self.refresh_style()
+
+    @property
+    def row_x(self):
+        return self.rows['x']
+
+    @property
+    def row_mid(self):
+        return self.rows['mid']
+
+    @property
+    def row_y(self):
+        return self.rows['y']
+
+    def set_label(self):
+        self.caption.setText('⟲ ' + sweep_label(self.sweep))
+
+    def refresh_style(self):
+        self.setStyleSheet(sweep_qss(self.win.is_selected(self.sweep.id)))
+
+    def mousePressEvent(self, ev):
+        if ev.button() == QtCore.Qt.MouseButton.LeftButton:
+            self._press_pos = mouse_pos(ev)
+            self.win.on_item_clicked(self.sweep.id, ev.modifiers())
+        ev.accept()
+
+    def mouseDoubleClickEvent(self, ev):
+        self.win.on_item_clicked(self.sweep.id, QtCore.Qt.KeyboardModifier())
+        ev.accept()
+
+    def mouseMoveEvent(self, ev):
+        if (self._press_pos is not None
+                and ev.buttons() & QtCore.Qt.MouseButton.LeftButton
+                and not self.win.running
+                and (mouse_pos(ev) - self._press_pos).manhattanLength() > 12):
+            self.win.begin_move_drag(self, self.sweep.id,
+                                     ev.globalPosition().toPoint())
+            return
+        ev.accept()
+
+    def mouseReleaseEvent(self, ev):
+        self._press_pos = None
+        ev.accept()
+
+    def _menu(self, pos):
+        win = self.win
+        win.on_item_clicked(self.sweep.id, QtCore.Qt.KeyboardModifier())
+        m = QtWidgets.QMenu(self)
+        m.addAction('Настройки свипа (справа)',
+                    lambda: win.on_item_clicked(self.sweep.id,
+                                                QtCore.Qt.KeyboardModifier()))
+        m.addAction('Разобрать свип', win.unwrap_sweep)
+        m.addSeparator()
+        m.addAction('◀ Влево', lambda: win.move_selected(-1))
+        m.addAction('▶ Вправо', lambda: win.move_selected(+1))
+        m.addSeparator()
+        m.addAction('Удалить', win.delete_selection)
+        m.exec(self.mapToGlobal(pos))
+
+
 # ---------------------------------------------------------------- колода
 # Стопки колоды по приборам: у каждого прибора свой набор стопок,
 # карты отличаются рисунком прибора, но стиль один (Meas всегда зелёная).
 DECK_GROUPS = [
     ('БП', [('set', 'Set', 'ps'), ('meas', 'Meas', 'ps'), ('on', 'ON/OFF', 'ps')]),
     ('Мультиметр', [('meas', 'Meas', 'mm')]),
-    ('Система', [('delay', 'Delay', 'sys')]),
+    ('Система', [('delay', 'Delay', 'sys'), ('sweep', 'Свип', 'sweep')]),
 ]
 
 
@@ -742,7 +932,8 @@ class StackWidget(QtWidgets.QFrame):
                 and (mouse_pos(ev) - self._press).manhattanLength() > 12):
             self._dragging = True
             self.win.begin_new_drag(self, self.card_type,
-                                    ev.globalPosition().toPoint())
+                                    ev.globalPosition().toPoint(),
+                                    device=self.device)
             return
         super().mouseMoveEvent(ev)
 
@@ -898,8 +1089,9 @@ class PlotWidget(QtWidgets.QWidget):
 # ---------------------------------------------------------------- окно
 # ---------------------------------------------------------------- окно отчёта
 class RunReportDialog(QtWidgets.QDialog):
-    """Всплывающее окно при запуске программы: таблица измерений,
-    график свипа и ошибки (если есть)."""
+    """Всплывающее окно при запуске программы: таблица измерений, графики
+    свипов (свой график на каждый уровень свипирования) и ошибки.
+    Свипов нет — графиков нет (остаётся только таблица)."""
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -954,16 +1146,29 @@ class RunReportDialog(QtWidgets.QDialog):
         lv.addWidget(self.error_box)
         lay.addWidget(left, 1)
 
-        right = QtWidgets.QWidget()
-        rv = QtWidgets.QVBoxLayout(right)
+        # правая панель: вкладки «Свип 1», «Свип 2», … — свой график на уровень
+        self.right = QtWidgets.QWidget()
+        rv = QtWidgets.QVBoxLayout(self.right)
         rv.setContentsMargins(4, 4, 4, 4)
-        self.plot = PlotWidget()
-        rv.addWidget(self.plot, 1)
-        lay.addWidget(right, 1)
+        self.tabs = QtWidgets.QTabWidget()
+        self.tabs.setDocumentMode(True)
+        rv.addWidget(self.tabs, 1)
+        self.plots = []
+        lay.addWidget(self.right, 1)
+        self.right.setVisible(False)
 
-    def begin_run(self):
+    def begin_run(self, n_sweeps=0):
+        """Начало прогона: n_sweeps графиков (по одному на уровень свипа)."""
         self.table.setRowCount(0)
-        self.plot.clear()
+        while self.tabs.count():
+            w = self.tabs.widget(0)
+            self.tabs.removeTab(0)
+            w.deleteLater()
+        self.plots = [PlotWidget() for _ in range(n_sweeps)]
+        for i, plot in enumerate(self.plots, 1):
+            self.tabs.addTab(plot, f'Свип {i}')
+        # свипов нет — графиков нет
+        self.right.setVisible(n_sweeps > 0)
         self.error_box.clear()
         self.error_box.hide()
         self.summary.setText('Измерений: 0')
@@ -988,8 +1193,15 @@ class RunReportDialog(QtWidgets.QDialog):
         hh.resizeSection(1, max(t.columnWidth(1), 55))
         hh.resizeSection(2, min(max(t.columnWidth(2), 150), 560))
 
-    def add_point(self, var, label, x, y):
-        self.plot.add_point(var, label, x, y)
+    def add_point(self, level, var, label, x, y):
+        """Точка графика: level — уровень свипа (0 — внешний)."""
+        if not 0 <= level < len(self.plots):
+            return
+        plot = self.plots[level]
+        first = not plot.series
+        plot.add_point(var, label, x, y)
+        if first and var:
+            self.tabs.setTabText(level, f'Свип {level + 1} · {var}')
 
     def add_error(self, text):
         self.error_box.appendPlainText(text)
@@ -1001,7 +1213,8 @@ class RunReportDialog(QtWidgets.QDialog):
         self.summary.setText(f'Измерений: {n} · программа {msg}')
 
     def save_results(self):
-        """Сохраняет отчёт в папку output: CSV с измерениями и PNG графика."""
+        """Сохраняет отчёт в папку output: CSV с измерениями и PNG графиков
+        (по одному на каждый уровень свипа)."""
         os.makedirs(OUTPUT_DIR, exist_ok=True)
         base = os.path.join(OUTPUT_DIR,
                             'report_' + datetime.now().strftime('%Y%m%d_%H%M%S'))
@@ -1020,12 +1233,16 @@ class RunReportDialog(QtWidgets.QDialog):
                 w.writerow(['ОШИБКИ'])
                 for line in errs.splitlines():
                     w.writerow([line])
-        png_path = base + '.png'
-        self.plot.grab().save(png_path)
-        self.summary.setText(
-            f'Измерений: {self.table.rowCount()} · сохранено: {os.path.basename(csv_path)}'
-            ' (+ график)')
-        return csv_path, png_path
+        png_paths = []
+        for i, plot in enumerate(self.plots, 1):
+            png_path = f'{base}_svip{i}.png' if len(self.plots) > 1 else base + '.png'
+            plot.grab().save(png_path)
+            png_paths.append(png_path)
+        saved = os.path.basename(csv_path)
+        if png_paths:
+            saved += f' (+ графиков: {len(png_paths)})'
+        self.summary.setText(f'Измерений: {self.table.rowCount()} · сохранено: {saved}')
+        return csv_path, png_paths
 
 
 class MainWindow(QtWidgets.QMainWindow):
@@ -1333,6 +1550,13 @@ class MainWindow(QtWidgets.QMainWindow):
             v = LoopView(item, self)
             v.body.set_items([self._make_view(c) for c in item.children])
             self._rows.append(v.body)
+        elif isinstance(item, SweepCard):
+            v = SweepView(item, self)
+            # отсеки в _rows ПОСЛЕ заполнения: тела циклов внутри отсеков
+            # оказываются раньше — при драге побеждает самый глубокий отсек
+            for role, lst in sweep_bays(item):
+                v.rows[role].set_items([self._make_view(c) for c in lst])
+                self._rows.append(v.rows[role])
         else:
             v = CardView(item, self)
         self.views[item.id] = v
@@ -1381,9 +1605,6 @@ class MainWindow(QtWidgets.QMainWindow):
         for _id, v in self.views.items():
             v.refresh_style()
 
-    def selected_top_indexes(self):
-        return sorted(i for i, it in enumerate(self.sequence) if it.id in self.selected)
-
     # ---------------------------------------------------------------- действия
     def add_card(self, card_type, device=None):
         """Клик по стопке колоды: карта добавляется в конец (ON авт. везёт OFF)."""
@@ -1399,12 +1620,12 @@ class MainWindow(QtWidgets.QMainWindow):
         """
         if self.running:
             return
-        cards = [new_card(card_type)]
-        if card_type == 'on':
-            cards.append(new_card('off'))
-        if device and card_type == 'meas':
-            for c in cards:
-                c.params['device'] = device
+        if card_type == 'sweep':
+            cards = [SweepCard()]           # настройки От/До/Шаг — справа
+        else:
+            cards = [new_card(card_type, device)]
+            if card_type == 'on':
+                cards.append(new_card('off'))
         index = max(0, min(index, len(container)))
         for k, c in enumerate(cards):
             container.insert(index + k, c)
@@ -1435,8 +1656,8 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         lst, idx = found
         item = lst[idx]
-        if isinstance(item, ForLoop):
-            return
+        if isinstance(item, (ForLoop, SweepCard)):
+            return          # копировать целиком цикл/свип с внутренними id нельзя
         import uuid as _uuid
         dup = copy.deepcopy(item)
         dup.id = _uuid.uuid4().hex[:8]
@@ -1463,12 +1684,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.update_actions()
 
     def move_item(self, item_id, target_list, index):
-        """Перестановка при «выкладывании» карты (внутри строки или между строками)."""
+        """Перестановка при «выкладывании» карты (внутри строки или между строками).
+
+        Цикл нельзя положить внутрь самого себя (в своё тело или тела
+        его вложенных циклов).
+        """
         found = find_container(self.sequence, item_id)
         if not found:
             return
         lst, idx = found
-        item = lst.pop(idx)
+        item = lst[idx]
+        if subtree_has_container(item, target_list):
+            return
+        lst.pop(idx)
         index = max(0, min(index, len(target_list)))
         target_list.insert(index, item)
         self.selected = {item_id}
@@ -1499,10 +1727,12 @@ class MainWindow(QtWidgets.QMainWindow):
         lst, idx = found
         obj = lst[idx]
         offset = press_global - view.mapToGlobal(QtCore.QPoint(0, 0))
+        pm = view.grab()
         state = {'kind': 'move', 'id': item_id, 'obj': obj,
                  'is_loop': isinstance(obj, ForLoop),
                  'source_view': view, 'source_row': view.parentWidget(),
-                 'ghost': self._make_ghost(view.grab(), press_global, offset),
+                 'pm_orig': pm,
+                 'ghost': self._make_ghost(pm, press_global, offset),
                  'offset': offset}
         self._mdrag = state
         src_row = state['source_row']
@@ -1520,29 +1750,68 @@ class MainWindow(QtWidgets.QMainWindow):
         offset = press_global - btn.mapToGlobal(QtCore.QPoint(0, 0))
         offset = QtCore.QPoint(min(max(offset.x(), 0), CardView.W),
                                min(max(offset.y(), 0), CardView.H))
+        pm = btn._drag_pixmap()
         state = {'kind': 'new', 'card_type': card_type, 'device': device,
-                 'is_loop': False,
-                 'ghost': self._make_ghost(btn._drag_pixmap(), press_global, offset),
+                 'is_loop': False, 'pm_orig': pm,
+                 'ghost': self._make_ghost(pm, press_global, offset),
                  'offset': offset}
         self._mdrag = state
         self.grabMouse()
 
     def _row_at(self, gpos):
-        """Строка под курсором: тело цикла приоритетнее ленты — его рамка
-        накрыта лентой, но точка внутри тела означает «внутрь цикла».
-        Циклы нельзя вкладывать друг в друга."""
+        """Строка под курсором: тело цикла/отсек свипа приоритетнее ленты —
+        их рамки накрыты лентой, но точка внутри означает «внутрь».
+        Циклы вкладываются друг в друга (уровни свипов), но не в самих себя:
+        тело перетаскиваемого цикла и его вложенных циклов недоступно.
+        Отсеки свип-карты принимают карты по своим правилам (_row_accepts)."""
         cands = [r for r in self._rows
                  if r.isVisible() and r.rect().contains(r.mapFromGlobal(gpos))]
         if not cands:
             return None
+        dragged = self._resolve(self._mdrag['id']) \
+            if self._mdrag and self._mdrag.get('is_loop') else None
         for row in cands:
+            if dragged is not None and subtree_has_container(dragged, row.container):
+                continue                   # внутрь самого себя нельзя
+            if not self._row_accepts(row):
+                continue                   # отсек не принимает эту карту
             if row.container is not self.sequence:
-                if not (self._mdrag and self._mdrag.get('is_loop')):
-                    return row
+                return row
         for row in cands:
             if row.container is self.sequence:
                 return row
         return None
+
+    def _row_accepts(self, row):
+        """Правила отсков свип-карты: X — одна Set-карта, Y — Meas-карты,
+        середина — любые карты, но не свип-карта. Остальные строки — всё."""
+        role = getattr(row, 'sweep_role', None)
+        if role is None or self._mdrag is None:
+            return True
+        st = self._mdrag
+        if role == 'mid':
+            if st['kind'] == 'new':
+                return st['card_type'] != 'sweep'
+            obj = self._resolve(st['id'])
+            return obj is not None and not isinstance(obj, SweepCard)
+        if role == 'x':
+            # ровно одна карта, и это Set (карту, взятую из этого же отсека,
+            # считаем «вернуть на место» — место для неё есть всегда)
+            if st['kind'] == 'new':
+                ok_type = st['card_type'] == 'set'
+                busy = bool(row.container)
+            else:
+                obj = self._resolve(st['id'])
+                ok_type = isinstance(obj, Card) and obj.type == 'set'
+                in_row = any(c is obj for c in row.container)
+                busy = bool(row.container) and not in_row
+            return ok_type and not busy
+        if role == 'y':
+            if st['kind'] == 'new':
+                return st['card_type'] == 'meas'
+            obj = self._resolve(st['id'])
+            return isinstance(obj, Card) and obj.type == 'meas'
+        return True
 
     def _move_drag(self, gpos):
         st = self._mdrag
@@ -1606,11 +1875,26 @@ class MainWindow(QtWidgets.QMainWindow):
         dock = self.deck_dock
         return dock.isVisible() and dock.rect().contains(dock.mapFromGlobal(gpos))
 
+    @staticmethod
+    def _tinted(pixmap, color):
+        """Полупрозрачная цветная заливка поверх копии pixmap (красная карта)."""
+        out = QtGui.QPixmap(pixmap.size())
+        out.fill(QtCore.Qt.GlobalColor.transparent)
+        p = QtGui.QPainter(out)
+        p.drawPixmap(0, 0, pixmap)
+        p.setCompositionMode(QtGui.QPainter.CompositionMode.CompositionMode_SourceAtop)
+        p.fillRect(out.rect(), color)
+        p.end()
+        return out
+
     def _set_deck_hover(self, on):
-        """Подсветка колоды во время переноса: отпустить здесь = удалить карту."""
+        """«Отпустить над колодой = удалить»: карта в руке краснеет."""
         self._deck_hover = on
-        self.deck_dock.setStyleSheet(
-            'QDockWidget::title { background: #dc2626; color: #ffffff; }' if on else '')
+        st = self._mdrag
+        if st is not None:
+            pm = st['pm_orig']
+            st['ghost'].setPixmap(
+                self._tinted(pm, QtGui.QColor(220, 38, 38, 150)) if on else pm)
         self.status.setText('Отпустите карту над колодой — она будет удалена из программы'
                             if on else '')
 
@@ -1627,6 +1911,13 @@ class MainWindow(QtWidgets.QMainWindow):
             self.anchor_id = st['id']
             self.unwrap_loop()
             self.status.setText('Цикл разобран — карты остались на ленте')
+            return
+        if isinstance(item, SweepCard):
+            # свип-карта так же разбирается: карты отсеков остаются на ленте
+            self.selected = {st['id']}
+            self.anchor_id = st['id']
+            self.unwrap_sweep()
+            self.status.setText('Свип разобран — карты остались на ленте')
             return
         ids = expand_on_off_pairs(self.sequence, {st['id']})   # ON/OFF — вместе
         n = remove_items(self.sequence, ids)
@@ -1656,28 +1947,37 @@ class MainWindow(QtWidgets.QMainWindow):
     def wrap_in_loop(self):
         if self.running:
             return
-        idxs = self.selected_top_indexes()
-        if not idxs:
+        if not self.selected:
             QtWidgets.QMessageBox.information(
                 self, 'Цикл', 'Выделите карты: клик, Ctrl+клик или Shift+клик.')
             return
-        if len(idxs) != len(self.selected):
-            QtWidgets.QMessageBox.warning(
-                self, 'Цикл',
-                'Обернуть в цикл можно только карты верхнего уровня.')
+        # все выделенные должны лежать в одной строке (лента или тело цикла)
+        founds = [find_container(self.sequence, i) for i in self.selected]
+        if any(f is None for f in founds):
             return
+        if len({id(f[0]) for f in founds}) != 1:
+            QtWidgets.QMessageBox.warning(
+                self, 'Цикл', 'Выделенные карты должны быть в одной строке.')
+            return
+        lst = founds[0][0]
+        if self._sweep_role_of(lst) in ('x', 'y'):
+            QtWidgets.QMessageBox.warning(
+                self, 'Цикл', 'В отсеках X и Y свипа циклы не собираются:\n'
+                'X — одна Set-карта, Y — Meas-карты.')
+            return
+        idxs = sorted(f[1] for f in founds)
         if idxs != list(range(idxs[0], idxs[-1] + 1)):
             QtWidgets.QMessageBox.warning(
                 self, 'Цикл', 'Выделенные карты должны идти подряд.')
             return
         loop = ForLoop(mode='count', count='3')     # настройки — справа
-        self._apply_wrap(idxs[0], idxs[-1], loop)
+        self._apply_wrap(lst, idxs[0], idxs[-1], loop)
 
-    def _apply_wrap(self, a, b, loop):
-        loop.children = self.sequence[a:b + 1]
-        self.sequence[a:b + 1] = [loop]
-        # если внутри одна Set-карта — свип сразу привязывается к ней
-        set_cards = collect_set_cards(loop.children)
+    def _apply_wrap(self, container, a, b, loop):
+        loop.children = container[a:b + 1]
+        container[a:b + 1] = [loop]
+        # если свипу доступна одна Set-карта — сразу привязываем её к нему
+        set_cards = sweep_candidates(loop)
         if len(set_cards) == 1:
             loop.target_id = set_cards[0].id
         self.selected = {loop.id}
@@ -1691,17 +1991,44 @@ class MainWindow(QtWidgets.QMainWindow):
     def unwrap_loop(self):
         if self.running:
             return
-        idxs = self.selected_top_indexes()
-        if len(idxs) != 1 or not isinstance(self.sequence[idxs[0]], ForLoop):
+        loop_ids = [i for i in self.selected
+                    if isinstance(self._resolve(i), ForLoop)]
+        if len(loop_ids) != 1:
             return
-        loop = self.sequence.pop(idxs[0])
-        self.sequence[idxs[0]:idxs[0]] = loop.children
+        found = find_container(self.sequence, loop_ids[0])
+        if not found:
+            return
+        lst, idx = found
+        loop = lst.pop(idx)
+        lst[idx:idx] = loop.children
         self.selected = {c.id for c in loop.children}
         self.anchor_id = next(iter(self.selected), None)
         self.rebuild_strip()
         self.rebuild_params()
         self.update_actions()
         self.append_log('Цикл разобран, карты сохранены', 'loop')
+
+    def unwrap_sweep(self):
+        """Свип-карта разбирается: X, середина и Y возвращаются на ленту."""
+        if self.running:
+            return
+        sweep_ids = [i for i in self.selected
+                     if isinstance(self._resolve(i), SweepCard)]
+        if len(sweep_ids) != 1:
+            return
+        found = find_container(self.sequence, sweep_ids[0])
+        if not found:
+            return
+        lst, idx = found
+        sweep = lst.pop(idx)
+        cards = sweep.x_cards + sweep.mid_cards + sweep.y_cards
+        lst[idx:idx] = cards
+        self.selected = {c.id for c in cards}
+        self.anchor_id = next(iter(self.selected), None)
+        self.rebuild_strip()
+        self.rebuild_params()
+        self.update_actions()
+        self.append_log('Свип разобран, карты сохранены', 'loop')
 
     # ---------------------------------------------------------------- параметры
     def rebuild_params(self):
@@ -1719,6 +2046,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._build_card_params(items[0])
         elif len(items) == 1 and isinstance(items[0], ForLoop):
             self._build_loop_params(items[0])
+        elif len(items) == 1 and isinstance(items[0], SweepCard):
+            self._build_sweep_params(items[0])
         else:
             lab = QtWidgets.QLabel(f'Выделено карт: {len(items)}\n\n'
                                    '⟳ Цикл — обернуть выделенные подряд карты.')
@@ -1772,6 +2101,25 @@ class MainWindow(QtWidgets.QMainWindow):
             return False
         return walk(self.sequence, False)
 
+    def _sweep_role_of(self, lst):
+        """Роль отсека свип-карты, которому принадлежит список lst
+        ('x'/'mid'/'y'), или None — обычная строка (лента/тело цикла)."""
+        def walk(seq):
+            for it in seq:
+                if isinstance(it, SweepCard):
+                    for role, bay in sweep_bays(it):
+                        if bay is lst:
+                            return role
+                    r = walk(it.mid_cards)
+                    if r:
+                        return r
+                elif isinstance(it, ForLoop):
+                    r = walk(it.children)
+                    if r:
+                        return r
+            return None
+        return walk(self.sequence)
+
     def _value_editor(self, card, key, default, extra_options=()):
         """Поле значения: число или константа.
 
@@ -1809,14 +2157,7 @@ class MainWindow(QtWidgets.QMainWindow):
             if is_meas and key == 'kind':
                 continue                      # режим добавим отдельно (зависит от прибора)
             if is_meas and key == 'device':
-                cb = QtWidgets.QComboBox()
-                for val, lab_opt in f['options']:
-                    cb.addItem(lab_opt, val)
-                cb.setCurrentIndex(max(0, cb.findData(str(card.params.get(key, 'ps')))))
-                cb.currentTextChanged.connect(
-                    lambda _t, cb=cb, c=card: self._meas_device_changed(c, cb.currentData()))
-                form.addRow(f['label'], cb)
-                continue
+                continue        # прибор фиксирован стопкой колоды, не меняется
             if is_meas and key == 'channel' and device != 'ps':
                 continue                      # канал есть только у БП
             if f.get('options'):
@@ -1854,14 +2195,6 @@ class MainWindow(QtWidgets.QMainWindow):
             hint2.setWordWrap(True)
             self.params_lay.addWidget(hint2)
 
-    def _meas_device_changed(self, card, device):
-        """У Meas-карты сменили прибор: пересобрать режимы и канал."""
-        card.params['device'] = device
-        valid = [v for v, _ in meas_kind_options(device)]
-        if card.params.get('kind') not in valid:
-            card.params['kind'] = valid[0]
-        self.rebuild_params()
-
     def _param_changed(self, card, key, text):
         card.params[key] = text
         v = self.views.get(card.id)
@@ -1869,17 +2202,25 @@ class MainWindow(QtWidgets.QMainWindow):
             v.refresh_body()
 
     def _build_loop_params(self, loop):
-        set_cards = collect_set_cards(loop.children)
+        # свободные Set-карты поддерева (карты вложенных свипов — заняты ими)
+        set_cards = sweep_candidates(loop)
+        taken = len(collect_set_cards(loop.children)) - len(set_cards)
+        nested = count_sweeps(loop.children)
         head = QtWidgets.QLabel(
-            f'<b>Цикл</b> · карт внутри: {len(loop.children)} · Set-карт: {len(set_cards)}')
+            f'<b>Цикл</b> · карт внутри: {len(loop.children)} · '
+            f'Set-карт для свипа: {len(set_cards)}'
+            + (f' · занято вложенными свипами: {taken}' if taken else '')
+            + (f' · вложенных свипов: {nested}' if nested else ''))
         head.setWordWrap(True)
         self.params_lay.addWidget(head)
 
         rb_count = QtWidgets.QRadioButton('Повторить N раз')
-        rb_sweep = QtWidgets.QRadioButton('Свипирование (ведёт Set-карты)')
+        rb_sweep = QtWidgets.QRadioButton('Свипирование (ведёт свою Set-карту)')
         rb_sweep.setEnabled(bool(set_cards))
         if not set_cards:
-            rb_sweep.setToolTip('Свипирование недоступно: внутри цикла нет Set-карт (Set)')
+            rb_sweep.setToolTip('Свипирование недоступно: нет свободной Set-карты — '
+                                'добавьте Set внутрь цикла (карты вложенных свипов '
+                                'заняты ими)')
         self.params_lay.addWidget(rb_count)
         self.params_lay.addWidget(rb_sweep)
 
@@ -1911,8 +2252,10 @@ class MainWindow(QtWidgets.QMainWindow):
             form_s.addRow('Свипируемая карта', cb_target)
         self.params_lay.addLayout(form_s)
 
-        hint = QtWidgets.QLabel('Свип сам подставляет значения во все Set-карты внутри '
-                                'цикла; Meas-карты попадают на график (X — свип).')
+        hint = QtWidgets.QLabel('Свип ведёт Set-карту своего уровня (X — свип). '
+                                'Циклы можно вкладывать: каждый свип — своя переменная '
+                                'и свой график; Meas-карта попадает на график ближайшего '
+                                'объемлющего свипа.')
         hint.setWordWrap(True)
         self.params_lay.addWidget(hint)
 
@@ -1938,7 +2281,16 @@ class MainWindow(QtWidgets.QMainWindow):
         bind(ed_stop, 'stop')
         bind(ed_step, 'step')
 
-        if loop.mode == 'sweep' and rb_sweep.isEnabled():
+        if loop.mode == 'sweep' and not set_cards:
+            warn = QtWidgets.QLabel('⚠ Режим «Свипирование», но свободной '
+                                    'Set-карты нет — свип будет пропущен. '
+                                    'Добавьте Set-карту внутрь цикла.')
+            warn.setWordWrap(True)
+            warn.setStyleSheet('color: #b45309;')
+            self.params_lay.addWidget(warn)
+        # режим не сбрасываем, даже если свип сейчас недоступен:
+        # достаточно добавить Set-карту — и свип заработает
+        if loop.mode == 'sweep':
             rb_sweep.setChecked(True)
         else:
             rb_count.setChecked(True)
@@ -1946,6 +2298,68 @@ class MainWindow(QtWidgets.QMainWindow):
 
         btn_unwrap = QtWidgets.QPushButton('Разобрать цикл')
         btn_unwrap.clicked.connect(self.unwrap_loop)
+        self.params_lay.addWidget(btn_unwrap)
+        btn_del = QtWidgets.QPushButton('Удалить')
+        btn_del.clicked.connect(self.delete_selection)
+        self.params_lay.addWidget(btn_del)
+
+    def _build_sweep_params(self, sweep):
+        """Настройки свип-карты: диапазон точек + состояние отсеков."""
+        x_card = x_set_card(sweep)
+        y_cards = [c for c in sweep.y_cards
+                   if isinstance(c, Card) and c.type == 'meas']
+        head = QtWidgets.QLabel(
+            f'<b>⟲ Свип</b> · точек: {sweep.start} → {sweep.stop}, шаг {sweep.step}'
+            f' · линий Y: {len(y_cards)} · карт посередине: {len(sweep.mid_cards)}')
+        head.setWordWrap(True)
+        self.params_lay.addWidget(head)
+
+        form = QtWidgets.QFormLayout()
+        ed_start = QtWidgets.QLineEdit(str(sweep.start))
+        ed_stop = QtWidgets.QLineEdit(str(sweep.stop))
+        ed_step = QtWidgets.QLineEdit(str(sweep.step))
+        form.addRow('От', ed_start)
+        form.addRow('До', ed_stop)
+        form.addRow('Шаг', ed_step)
+        self.params_lay.addLayout(form)
+
+        info = QtWidgets.QLabel(
+            'X: ' + (summarize(x_card) if x_card is not None
+                     else 'пусто — положите Set-карту')
+            + '\nY: ' + ('; '.join(describe(c) for c in y_cards) or
+                         'пусто — положите Meas-карты (линия на каждую)')
+            + f'\nСередина: {len(sweep.mid_cards)} карт (выполняются на каждой точке)')
+        info.setWordWrap(True)
+        self.params_lay.addWidget(info)
+
+        hint = QtWidgets.QLabel('В отсек X кладётся ровно одна Set-карта — её '
+                                'значение ведёт свип (ось X). В Y — Meas-карты, '
+                                'каждая даёт свою линию на графике. Середина — '
+                                'любые карты, выполняются на каждой точке.')
+        hint.setWordWrap(True)
+        self.params_lay.addWidget(hint)
+        if x_card is None:
+            warn = QtWidgets.QLabel('⚠ В отсеке X нет Set-карты — '
+                                    'свип будет пропущен.')
+            warn.setWordWrap(True)
+            warn.setStyleSheet('color: #b45309;')
+            self.params_lay.addWidget(warn)
+
+        def refresh():
+            v = self.views.get(sweep.id)
+            if v is not None:
+                v.set_label()
+                v.updateGeometry()
+
+        def bind(ed, attr):
+            ed.textEdited.connect(lambda t, s=sweep, a=attr: (setattr(s, a, t), refresh()))
+
+        bind(ed_start, 'start')
+        bind(ed_stop, 'stop')
+        bind(ed_step, 'step')
+
+        btn_unwrap = QtWidgets.QPushButton('Разобрать свип')
+        btn_unwrap.clicked.connect(self.unwrap_sweep)
         self.params_lay.addWidget(btn_unwrap)
         btn_del = QtWidgets.QPushButton('Удалить')
         btn_del.clicked.connect(self.delete_selection)
@@ -1998,8 +2412,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self._run_thread.sig_meas.connect(self.report_dialog.add_meas)
         self.running = True
         self._set_ui_running(True)
-        # всплывающее окно отчёта: таблица + график + ошибки
-        self.report_dialog.begin_run()
+        # всплывающее окно отчёта: таблица + график на каждый работающий свип
+        # (циклы-свипы и свип-карты; свипов нет — графиков нет)
+        self.report_dialog.begin_run(len(sweep_units(seq_copy)))
         self.report_dialog.show()
         self.report_dialog.raise_()
         self.append_log('── Запуск программы ──', 'loop')
@@ -2079,8 +2494,8 @@ class MainWindow(QtWidgets.QMainWindow):
     # ---------------------------------------------------------------- actions
     def update_actions(self):
         self.run_btn.setEnabled(not self.running and bool(self.sequence))
-        self.act_loop.setEnabled(
-            not self.running and bool(self.selected_top_indexes()))
+        # обернуть в цикл можно выделенное на любом уровне (лента или тело цикла)
+        self.act_loop.setEnabled(not self.running and bool(self.selected))
         self.act_save.setEnabled(not self.running)
         self.act_open.setEnabled(not self.running)
 
