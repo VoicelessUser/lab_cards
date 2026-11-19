@@ -313,9 +313,17 @@ class CardRowWidget(QtWidgets.QWidget):
         self.relayout()
 
     def _view_width(self, v):
+        # показанный вид занимает своё фактическое место: кадры циклов/свипов
+        # после apply_zoom шире minimumSizeHint (тот — статические минимумы
+        # отсеков, без содержимого), и соседи должны отталкиваться от реальной
+        # ширины, иначе наезжают друг на друга
+        if v.isVisible():
+            return max(v.width(), 20)
         return max(v.minimumSizeHint().width(), 20)
 
     def _view_height(self, v):
+        if v.isVisible():
+            return max(v.height(), 20)
         return max(v.minimumSizeHint().height(), 20)
 
     def _active_views(self):
@@ -454,7 +462,91 @@ class CardRowWidget(QtWidgets.QWidget):
 
 
 # ---------------------------------------------------------------- виджеты карт
-class CardView(QtWidgets.QFrame):
+class ProgramItemView(QtWidgets.QFrame):
+    """Базовый класс выложенной карты (карта / цикл / свип).
+
+    Общее поведение всех трёх видов собрано здесь: клик — выделение и
+    настройки справа; «взял мышью — карта летит за курсором» (ручной
+    перенос через win.begin_move_drag); контекстное меню: специфичные
+    пункты подкласса (_fill_menu) + перемещение/удаление; применение
+    масштаба (apply_zoom). Подкласс задаёт модель (obj), отрисовку и
+    пункты меню — методы перемещения всегда работают одинаково для
+    любого вида карты.
+    """
+
+    def __init__(self, obj, win):
+        super().__init__()
+        self.obj = obj              # Card | ForLoop | SweepCard — модель
+        self.win = win
+        self._press_pos = None
+        self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._menu)
+
+    def item_id(self):
+        """id модели — ключ в win.views и цель методов перемещения."""
+        return self.obj.id
+
+    def apply_zoom(self):
+        """Новый масштаб (Ctrl+колесо): кадр подгоняется под содержимое.
+
+        Кэш sizeHint у layout'а сбрасывается только по «грязному» флагу
+        (его ставит updateGeometry потомков), поэтому сбрасываем сами
+        (invalidate) и пересчитываем (activate); adjustSize() к тому же
+        не ужимает уже показанный виджет — размер ставим явно из sizeHint.
+        """
+        lay = self.layout()
+        if lay is not None:
+            lay.invalidate()
+            lay.activate()
+        self.resize(self.sizeHint().expandedTo(self.minimumSizeHint()))
+
+    # ------------------------------------------- мышь: выделение + перенос
+    def mousePressEvent(self, ev):
+        if ev.button() == QtCore.Qt.MouseButton.LeftButton:
+            self._press_pos = mouse_pos(ev)
+            self.win.on_item_clicked(self.obj.id, ev.modifiers())
+        # клик принадлежит карте: не отдаём его жёлтой зоне цикла,
+        # иначе она перебивала выделение и настройки карты (справа)
+        ev.accept()
+
+    def mouseDoubleClickEvent(self, ev):
+        # нет всплывающих окон: показать настройки справа
+        self.win.on_item_clicked(self.obj.id, QtCore.Qt.KeyboardModifier())
+        ev.accept()
+
+    def mouseMoveEvent(self, ev):
+        if (self._press_pos is not None
+                and ev.buttons() & QtCore.Qt.MouseButton.LeftButton
+                and not self.win.running
+                and (mouse_pos(ev) - self._press_pos).manhattanLength() > 12):
+            self.win.begin_move_drag(self, self.obj.id,
+                                     ev.globalPosition().toPoint())
+            return
+        ev.accept()
+
+    def mouseReleaseEvent(self, ev):
+        self._press_pos = None
+        ev.accept()
+
+    # ------------------------------------------- меню: подкласс + общие
+    def _menu(self, pos):
+        win = self.win
+        win.on_item_clicked(self.obj.id, QtCore.Qt.KeyboardModifier())
+        m = QtWidgets.QMenu(self)
+        self._fill_menu(m, win)
+        m.addSeparator()
+        m.addAction('◀ Влево', lambda: win.move_selected(-1))
+        m.addAction('▶ Вправо', lambda: win.move_selected(+1))
+        m.addSeparator()
+        m.addAction('Удалить', win.delete_selection)
+        m.exec(self.mapToGlobal(pos))
+
+    def _fill_menu(self, m, win):
+        """Специфичные пункты меню подкласса (перед перемещением/удалением)."""
+
+
+class CardView(ProgramItemView):
     """Коллекционная карта (как в ККГ): вертикальная, сверху баннер с названием,
     в середине большой рисунок прибора, ниже тёмная панель параметров (статы),
     внизу подпись прибора. Цвет карты — по типу действия (Meas всегда зелёная).
@@ -478,14 +570,9 @@ class CardView(QtWidgets.QFrame):
         self.update()
 
     def __init__(self, card, win):
-        super().__init__()
+        super().__init__(card, win)
         self.card = card
-        self.win = win
         self.setFixedSize(self.view_size())
-        self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
-        self.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
-        self.customContextMenuRequested.connect(self._menu)
-        self._press_pos = None
 
     def minimumSizeHint(self):
         # без layout у paint-карты Qt вернул бы «пусто», и раскладчик
@@ -580,67 +667,30 @@ class CardView(QtWidgets.QFrame):
                    int(QtCore.Qt.AlignmentFlag.AlignCenter),
                    card_device_label(self.card))
 
-    def mousePressEvent(self, ev):
-        if ev.button() == QtCore.Qt.MouseButton.LeftButton:
-            self._press_pos = mouse_pos(ev)
-            self.win.on_item_clicked(self.card.id, ev.modifiers())
-        # клик принадлежит карте: не отдаём его жёлтой зоне цикла,
-        # иначе она перебивала выделение и настройки карты (справа)
-        ev.accept()
-
-    def mouseDoubleClickEvent(self, ev):
-        # двойной клик по карте не должен выделять цикл
-        ev.accept()
-
-    def mouseMoveEvent(self, ev):
-        if (self._press_pos is not None
-                and ev.buttons() & QtCore.Qt.MouseButton.LeftButton
-                and not self.win.running
-                and (mouse_pos(ev) - self._press_pos).manhattanLength() > 12):
-            self.win.begin_move_drag(self, self.card.id,
-                                     ev.globalPosition().toPoint())
-            return
-        ev.accept()
-
-    def mouseReleaseEvent(self, ev):
-        self._press_pos = None
-        ev.accept()
-
-    def _menu(self, pos):
-        win = self.win
-        win.on_item_clicked(self.card.id, QtCore.Qt.KeyboardModifier())
-        m = QtWidgets.QMenu(self)
-        m.addAction('◀ Влево', lambda: win.move_selected(-1))
-        m.addAction('▶ Вправо', lambda: win.move_selected(+1))
+    def _fill_menu(self, m, win):
         m.addAction('Дублировать', win.duplicate_selected)
         m.addSeparator()
         m.addAction('⟳ Обернуть в цикл', win.wrap_in_loop)
-        m.addSeparator()
-        m.addAction('Удалить', win.delete_selection)
-        m.exec(self.mapToGlobal(pos))
 
 
-class LoopView(QtWidgets.QFrame):
+class LoopView(ProgramItemView):
     """Зона цикла: жёлтая градиентная подложка ПОД картами. Клик по ней
     выделяет цикл (настройки справа), клики по картам работают как обычно."""
 
     def __init__(self, loop, win):
-        super().__init__()
+        super().__init__(loop, win)
         self.loop = loop
-        self.win = win
         self.setObjectName('loopFrame')
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(9, 4, 9, 7)
         lay.setSpacing(2)
         self.caption = QtWidgets.QLabel('⟳ ' + loop_label(loop))
         self.caption.setObjectName('loopCaption')
+        # при обзорном масштабе подпись прячется (см. apply_zoom)
+        self.caption.setVisible(self.win.zoom >= 0.6)
         lay.addWidget(self.caption)
         self.body = CardRowWidget(win, loop.children)
         lay.addWidget(self.body, 1)
-        self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
-        self.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
-        self.customContextMenuRequested.connect(self._menu)
-        self._press_pos = None
         self.refresh_style()
 
     def set_label(self):
@@ -650,50 +700,18 @@ class LoopView(QtWidgets.QFrame):
         self.setStyleSheet(loop_qss(self.win.is_selected(self.loop.id)))
 
     def apply_zoom(self):
-        # тело цикла считает размеры от minimumSizeHint карт —
-        # достаточно пересчитать геометрию
-        self.updateGeometry()
+        """Новый масштаб: тело считает размеры от minimumSizeHint карт —
+        updateGeometry объявляет их лэйауту (иначе тот отдаст кэшированный
+        sizeHint со старыми размерами), затем кадр подгоняется под них.
+        Подпись цикла при сильном уменьшении прячется (держит высоту)."""
+        self.caption.setVisible(self.win.zoom >= 0.6)
+        self.body.updateGeometry()
+        super().apply_zoom()
 
-    def mousePressEvent(self, ev):
-        if ev.button() == QtCore.Qt.MouseButton.LeftButton:
-            self._press_pos = mouse_pos(ev)
-            self.win.on_item_clicked(self.loop.id, ev.modifiers())
-        # клик по жёлтой зоне — настройка цикла (справа); карты принимают
-        # свои клики сами и до зоны они не доходят
-        ev.accept()
-
-    def mouseDoubleClickEvent(self, ev):
-        # нет всплывающих окон: показать настройки цикла справа
-        self.win.on_item_clicked(self.loop.id, QtCore.Qt.KeyboardModifier())
-        ev.accept()
-
-    def mouseMoveEvent(self, ev):
-        if (self._press_pos is not None
-                and ev.buttons() & QtCore.Qt.MouseButton.LeftButton
-                and not self.win.running
-                and (mouse_pos(ev) - self._press_pos).manhattanLength() > 12):
-            self.win.begin_move_drag(self, self.loop.id,
-                                     ev.globalPosition().toPoint())
-            return
-        ev.accept()
-
-    def mouseReleaseEvent(self, ev):
-        self._press_pos = None
-        ev.accept()
-
-    def _menu(self, pos):
-        win = self.win
-        win.on_item_clicked(self.loop.id, QtCore.Qt.KeyboardModifier())
-        m = QtWidgets.QMenu(self)
+    def _fill_menu(self, m, win):
         m.addAction('Настройки цикла (справа)',
                     lambda: win.on_item_clicked(self.loop.id, QtCore.Qt.KeyboardModifier()))
         m.addAction('Разобрать цикл', win.unwrap_loop)
-        m.addSeparator()
-        m.addAction('◀ Влево', lambda: win.move_selected(-1))
-        m.addAction('▶ Вправо', lambda: win.move_selected(+1))
-        m.addSeparator()
-        m.addAction('Удалить', win.delete_selection)
-        m.exec(self.mapToGlobal(pos))
 
 
 # ---------------------------------------------------------------- свип-карта
@@ -728,7 +746,7 @@ SWEEP_BAY_LABELS = {
 }
 
 
-class SweepView(QtWidgets.QFrame):
+class SweepView(ProgramItemView):
     """Свип-карта: жёлтая зона с тремя отсеками-строками.
 
     Слева X — одна Set-карта, посередине — любые карты, справа Y — Meas-карты.
@@ -737,9 +755,8 @@ class SweepView(QtWidgets.QFrame):
     """
 
     def __init__(self, sweep, win):
-        super().__init__()
+        super().__init__(sweep, win)
         self.sweep = sweep
-        self.win = win
         self.setObjectName('sweepFrame')
         lay = QtWidgets.QVBoxLayout(self)
         lay.setContentsMargins(9, 4, 9, 7)
@@ -754,6 +771,8 @@ class SweepView(QtWidgets.QFrame):
         bays = QtWidgets.QHBoxLayout()
         bays.setSpacing(6)
         self.rows = {}                     # роль -> CardRowWidget
+        self.bays = {}                     # роль -> QFrame отсека
+        self.bay_labels = {}               # роль -> QLabel (прячется при зуме)
         for role, lst in sweep_bays(sweep):
             bay = QtWidgets.QFrame()
             bay.setObjectName('sweepBay')
@@ -771,13 +790,16 @@ class SweepView(QtWidgets.QFrame):
             # свипы одного размера; дальше — только рост с добавлением карт
             row.setMinimumSize(*self._row_min_size())
             bv.addWidget(row, 1)
-            bays.addWidget(bay, 1)
+            # без stretch: равные доли (stretch=1) заставляют QHBoxLayout
+            # делить ширину поровну и игнорировать sizeHint наполненного
+            # отсека — карты за его краем обрезались; без stretch отсеки
+            # раскладываются по sizeHint и растут вместе с картами
+            bays.addWidget(bay)
             self.rows[role] = row
+            self.bays[role] = bay
+            self.bay_labels[role] = lab
         lay.addLayout(bays, 1)
-        self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
-        self.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
-        self.customContextMenuRequested.connect(self._menu)
-        self._press_pos = None
+        self._apply_chrome()
         self.refresh_style()
 
     @property
@@ -799,11 +821,32 @@ class SweepView(QtWidgets.QFrame):
         return (int(round(CardRowWidget.MARGIN_L + CardView.W * z + CardRowWidget.MARGIN_R)),
                 int(round(CardRowWidget.MARGIN_T + CardView.H * z + CardRowWidget.MARGIN_B)))
 
+    def _apply_chrome(self):
+        """Подписи свипа и отсеков с масштабом: при сильном уменьшении
+        прячутся — на обзорном масштабе доминируют сами карты, а ширина
+        подписи не должна держать жёлтую зону большой."""
+        z = self.win.zoom
+        show = z >= 0.6
+        self.caption.setVisible(show)
+        if show:
+            self.caption.setFixedHeight(round(16 * z))
+        for lab in self.bay_labels.values():
+            lab.setVisible(show)
+            if show:
+                lab.setFixedHeight(round(14 * z))
+
     def apply_zoom(self):
-        """Новый масштаб: минимум отсеков — под карту нового размера."""
+        """Новый масштаб: минимумы отсеков — под карту нового размера,
+        кадр сжимается под них (без resize жёлтая зона остаётся большой)."""
+        self._apply_chrome()
         for row in self.rows.values():
             row.setMinimumSize(*self._row_min_size())
-        self.updateGeometry()
+        # отсек объявляет новый размер кадру: лэйаут кэширует sizeHint
+        # виджета-отсека, и без updateGeometry вернёт старый (двухуровневая
+        # иерархия: строка -> отсек -> свип, одного setMinimumSize мало)
+        for bay in self.bays.values():
+            bay.updateGeometry()
+        super().apply_zoom()
 
     def set_label(self):
         self.caption.setText('⟲ ' + sweep_label(self.sweep))
@@ -811,44 +854,11 @@ class SweepView(QtWidgets.QFrame):
     def refresh_style(self):
         self.setStyleSheet(sweep_qss(self.win.is_selected(self.sweep.id)))
 
-    def mousePressEvent(self, ev):
-        if ev.button() == QtCore.Qt.MouseButton.LeftButton:
-            self._press_pos = mouse_pos(ev)
-            self.win.on_item_clicked(self.sweep.id, ev.modifiers())
-        ev.accept()
-
-    def mouseDoubleClickEvent(self, ev):
-        self.win.on_item_clicked(self.sweep.id, QtCore.Qt.KeyboardModifier())
-        ev.accept()
-
-    def mouseMoveEvent(self, ev):
-        if (self._press_pos is not None
-                and ev.buttons() & QtCore.Qt.MouseButton.LeftButton
-                and not self.win.running
-                and (mouse_pos(ev) - self._press_pos).manhattanLength() > 12):
-            self.win.begin_move_drag(self, self.sweep.id,
-                                     ev.globalPosition().toPoint())
-            return
-        ev.accept()
-
-    def mouseReleaseEvent(self, ev):
-        self._press_pos = None
-        ev.accept()
-
-    def _menu(self, pos):
-        win = self.win
-        win.on_item_clicked(self.sweep.id, QtCore.Qt.KeyboardModifier())
-        m = QtWidgets.QMenu(self)
+    def _fill_menu(self, m, win):
         m.addAction('Настройки свипа (справа)',
                     lambda: win.on_item_clicked(self.sweep.id,
                                                 QtCore.Qt.KeyboardModifier()))
         m.addAction('Разобрать свип', win.unwrap_sweep)
-        m.addSeparator()
-        m.addAction('◀ Влево', lambda: win.move_selected(-1))
-        m.addAction('▶ Вправо', lambda: win.move_selected(+1))
-        m.addSeparator()
-        m.addAction('Удалить', win.delete_selection)
-        m.exec(self.mapToGlobal(pos))
 
 
 # ---------------------------------------------------------------- колода
@@ -1463,8 +1473,20 @@ class MainWindow(QtWidgets.QMainWindow):
         if abs(z - self.zoom) < 1e-6:
             return
         self.zoom = z
-        for v in self.views.values():
-            v.apply_zoom()
+        # применяем изнутри наружу: кадр цикла/свипа подгоняется под уже
+        # ужавшихся детей, иначе его sizeHint в момент ресайза ещё старый
+        depths = {}
+        def _walk(seq, d):
+            for it in seq:
+                depths[it.id] = d
+                if isinstance(it, ForLoop):
+                    _walk(it.children, d + 1)
+                elif isinstance(it, SweepCard):
+                    for _role, bay in sweep_bays(it):
+                        _walk(bay, d + 1)
+        _walk(self.sequence, 0)
+        for item_id in sorted(self.views, key=lambda i: -depths.get(i, 0)):
+            self.views[item_id].apply_zoom()
         for r in self._rows:
             r.relayout()
         self.status.setText(f'Масштаб программы: {int(round(z * 100))}%')
