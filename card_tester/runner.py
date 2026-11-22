@@ -2,13 +2,16 @@
 """Движок выполнения программы проверки.
 
 execute_program() — чистая логика (тестируется без GUI): подключает приборы
-lib_visa, идёт по программе слева направо, разворачивает циклы. Свипирование
-(цикл mode='sweep') ведёт свою Set-карту: на каждой точке подставляет значение
-в её поле value. Карты раздаёт resolve_sweeps() (см. cards.py): вложенный свип
-забирает свою карту первым, внешний — первую свободную; если карта ведомаого
-внешним свипом лежит внутри вложенного, значение подставляет сам внешний свип,
-а вложенные эту карту пропускают. Свип-карта (SweepCard) работает так же, но
-её переменная — Set-карта отсека X, а измерения — Meas-карты отсека Y (каждая
+lib_visa, идёт по программе слева направо, разворачивает циклы. Приборы —
+коробки из колоды: settings — {id коробки: {kind, model, port}}, каждая
+задействованная карта ведёт свой прибор через params['device'] = id коробки
+(БП и мультиметров может быть по несколько). Свипирование (цикл mode='sweep')
+ведёт свою Set-карту: на каждой точке подставляет значение в её поле value.
+Карты раздаёт resolve_sweeps() (см. cards.py): вложенный свип забирает свою
+карту первым, внешний — первую свободную; если карта ведомаого внешним свипом
+лежит внутри вложенного, значение подставляет сам внешний свип, а вложенные
+эту карту пропускают. Свип-карта (SweepCard) работает так же, но её
+переменная — Set-карта отсека X, а измерения — Meas-карты отсека Y (каждая
 — своя линия на графике); карты середины выполняются на каждой точке. Точка
 уходит в on_meas с номером уровня — порядковый номер работающего свипа
 (sweep_units, 0 — первый): у каждого свипа свой график; свипов нет — точек нет.
@@ -20,8 +23,9 @@ from datetime import datetime
 
 from .qt import QtCore, Signal
 from .cards import (Card, ForLoop, SweepCard, substitute, describe, loop_label,
-                    used_groups, collect_set_cards, own_level_set_cards,
-                    resolve_sweeps, sweep_units, x_set_card, CATALOG)
+                    used_devices, collect_set_cards, own_level_set_cards,
+                    resolve_sweeps, sweep_units, x_set_card, CATALOG,
+                    DEVICE_KIND_TITLES)
 
 PS_MODELS = ['DP832A', 'NGE100', 'AKIP1143', 'TH6400']
 MM_MODELS = ['DM3068', 'AKIP2101', 'SDM3045X']
@@ -63,7 +67,7 @@ def make_device(group, model, port, log):
 
 
 def _ps_channel(ctx, params):
-    dev = ctx.devices.get('ps')
+    dev = ctx.devices.get(params.get('device', ''))
     if dev is None:
         raise RuntimeError('Источник питания не подключён')
     n = int(to_float(substitute(params.get('channel', '1'), ctx.vars), 'Канал'))
@@ -105,8 +109,9 @@ def do_action(card, ctx):
         return None, None
 
     if t == 'meas':
-        if p.get('device', 'ps') == 'mm':
-            dev = ctx.devices.get('mm')
+        dev_id = p.get('device', '')
+        if ctx.device_kinds.get(dev_id, 'ps') == 'mm':
+            dev = ctx.devices.get(dev_id)
             if dev is None:
                 raise RuntimeError('Мультиметр не подключён')
             kind = p.get('kind', 'voltage_dc')
@@ -153,7 +158,7 @@ def exec_card(card, ctx, depth):
         return
     ind = '  ' * depth
     ctx.steps += 1
-    line = f'{ind}Шаг {ctx.steps}: {describe(card, ctx.vars)}'
+    line = f'{ind}Шаг {ctx.steps}: {describe(card, ctx.vars, kinds=ctx.device_kinds)}'
     try:
         result, value = do_action(card, ctx)
     except StopRun:
@@ -166,13 +171,13 @@ def exec_card(card, ctx, depth):
         stamp = datetime.now().strftime('%H:%M:%S.%f')[:-3]
         # каждая Meas-карта попадает в отчёт (время замера + значение)
         if ctx.on_result:
-            ctx.on_result(describe(card, ctx.vars), result, stamp)
+            ctx.on_result(describe(card, ctx.vars, kinds=ctx.device_kinds), result, stamp)
         # точка для графика: если идёт свипирование — ближайшего уровня;
         # уровень — порядковый номер работающего свипа (0 — первый),
         # у каждого свипа свой график
         if value is not None and ctx.sweep_stack and ctx.on_meas:
             _owner, var, x, level = ctx.sweep_stack[-1]
-            ctx.on_meas(level, var, x, describe(card, ctx.vars), value)
+            ctx.on_meas(level, var, x, describe(card, ctx.vars, kinds=ctx.device_kinds), value)
     else:
         ctx.log(line, 'info')
 
@@ -233,7 +238,7 @@ def run_loop(loop, ctx, depth):
                       for c in own_level_set_cards(loop.children))
         note = '' if in_body else ' (карта внутри вложенного свипа)'
         ctx.log(f'{ind}⟳ СВИП {loop.start} → {loop.stop}, шаг {loop.step} — '
-                f'{len(vals)} точек · {describe(target)}{note}', 'loop')
+                f'{len(vals)} точек · {describe(target, kinds=ctx.device_kinds)}{note}', 'loop')
         level = ctx.sweep_levels.get(loop.id, 0)
         ctx.sweep_stack.append((loop.id, x_name, vals[0] if vals else 0.0, level))
         try:
@@ -275,7 +280,7 @@ def run_sweep_card(sweep, ctx, depth):
     vals = loop_values(sweep)
     x_name = _sweep_x_label([x_card])
     ctx.log(f'{ind}⟲ СВИП {sweep.start} → {sweep.stop}, шаг {sweep.step} — '
-            f'{len(vals)} точек · {describe(x_card)} · линий Y: {len(y_cards)}',
+            f'{len(vals)} точек · {describe(x_card, kinds=ctx.device_kinds)} · линий Y: {len(y_cards)}',
             'loop')
     level = ctx.sweep_levels.get(sweep.id, 0)
     ctx.sweep_stack.append((sweep.id, x_name, vals[0] if vals else 0.0, level))
@@ -318,6 +323,7 @@ class RunContext:
         self.sweep_levels = {}         # id свипа (цикл или карта) -> номер графика          # [(loop.id, подпись оси X, значение)]
         self.sweep_owners = {}         # loop.id -> Set-карта (resolve_sweeps)
         self.card_owner = {}           # card.id -> loop.id (защита от перезаписи)
+        self.device_kinds = {}         # id коробки -> 'ps'/'mm' (тип прибора)
         self.on_meas = on_meas         # callback(уровень, имя_оси, x, подпись, y) — свип
         self.on_result = on_result     # callback(описание, текст, время) — все Meas
 
@@ -326,6 +332,7 @@ def execute_program(sequence, settings, log, should_stop, constants=None,
                     on_meas=None, on_result=None):
     """Подключает нужные приборы, выполняет программу, гарантированно отключает.
 
+    settings — настройки коробок-приборов: {id коробки: {kind, model, port}}.
     constants — словарь общих констант {имя: значение}, доступны в полях карт.
     on_meas — callback(уровень, имя_оси, x, подпись_измерения, y): вызывается
     для каждой Meas-карты внутри цикла-диапазона (данные для графика; уровень —
@@ -334,7 +341,7 @@ def execute_program(sequence, settings, log, should_stop, constants=None,
     КАЖДОЙ Meas-карты (данные для отчёта).
     Возвращает True при полном прохождении без ошибок.
     """
-    devices = {}
+    devices = {}                   # id коробки -> объект прибора
     ctx = RunContext(devices, log, should_stop, vars=constants,
                      on_meas=on_meas, on_result=on_result)
     owners = resolve_sweeps(sequence)
@@ -344,17 +351,24 @@ def execute_program(sequence, settings, log, should_stop, constants=None,
                       if c is not None}
     ok = False
     try:
-        groups = used_groups(sequence)
-        if not groups:
+        used = used_devices(sequence)
+        if not used:
             log('Программа пуста', 'warn')
             return False
-        for g, title in (('ps', 'БП'), ('mm', 'ММ')):
-            if g in groups:
-                cfg = settings.get(g, {})
-                dev = make_device(g, cfg.get('model', ''), cfg.get('port', ''), log)
-                dev.connect()
-                devices[g] = dev
-                log(f'{title}: подключён ({cfg.get("model", "?")} → {cfg.get("port", "?")})', 'ok')
+        # БП подключаем первыми (порядок в логе)
+        ordered = sorted(used,
+                         key=lambda i: 0 if settings.get(i, {}).get('kind') == 'ps' else 1)
+        for dev_id in ordered:
+            cfg = settings.get(dev_id)
+            if cfg is None:
+                raise ValueError('карта ссылается на удалённую коробку прибора')
+            kind = cfg.get('kind', 'ps')
+            title = DEVICE_KIND_TITLES.get(kind, kind)
+            dev = make_device(kind, cfg.get('model', ''), cfg.get('port', ''), log)
+            dev.connect()
+            devices[dev_id] = dev
+            ctx.device_kinds[dev_id] = kind
+            log(f'{title} {cfg.get("model", "?")}: подключён ({cfg.get("port", "?")})', 'ok')
 
         run_items(sequence, ctx)
         log(f'✓ Программа завершена: шагов {ctx.steps}, ошибок нет', 'ok')
@@ -364,12 +378,12 @@ def execute_program(sequence, settings, log, should_stop, constants=None,
     except Exception as e:
         log(f'✗ Ошибка: {e}', 'error')
     finally:
-        ps = devices.get('ps')
-        if ps is not None:
-            try:
-                ps.all_channels_off()
-            except Exception:
-                pass
+        for dev_id, dev in devices.items():
+            if ctx.device_kinds.get(dev_id, 'ps') == 'ps':
+                try:
+                    dev.all_channels_off()
+                except Exception:
+                    pass
         for dev in devices.values():
             try:
                 dev.disconnect()

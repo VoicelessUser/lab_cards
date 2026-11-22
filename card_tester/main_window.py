@@ -4,7 +4,10 @@
 Перетаскивание ручное (как в Hearthstone): карту «берёшь» из колоды или ленты,
 она летит за курсором, место вставки подсвечивается линией, соседние карты
 разъезжаются; «выкладываешь» на ленту или в цикл. Всплывающих окон нет —
-настройки карты и цикла всегда справа. Лог-окна нет: во время запуска
+настройки карты, цикла и КОРОБКИ всегда справа. Коробки-приборы в колоде:
+каждый набор карт лежит в своей коробке = один прибор (модель + VISA-адрес
+настраиваются кликом по коробке); кнопка «+» добавляет коробку — БП или
+мультиметров может быть по несколько. Лог-окна нет: во время запуска
 пользователь видит графики свипов (свой на каждый уровень) и последнюю
 строку статуса. Циклы вкладываются друг в друга — каждый свип ведёт свою
 Set-карту (цикл в цикле = уровни свипирования).
@@ -19,6 +22,9 @@ from datetime import datetime
 from .qt import (QtCore, QtGui, QtWidgets, Signal,
                  QAction, QShortcut, mouse_pos)
 from .cards import (Card, ForLoop, SweepCard, CATALOG, C_LOOP, DEVICE_LABELS,
+                    DeviceBox, DEVICE_KIND_TITLES, DEVICE_CARD_TYPES,
+                    DEFAULT_PS, DEFAULT_MM, device_display_name, device_title,
+                    find_box,
                     new_card, describe, summarize, loop_label, find_container,
                     remove_items, expand_on_off_pairs, sweep_candidates,
                     collect_set_cards, count_sweeps, subtree_has_container,
@@ -33,18 +39,18 @@ KIND_COLORS = {
     'error': '#b91c1c', 'warn': '#b45309', 'loop': '#6d28d9', 'hw': '#6b7280',
 }
 
+# раздача карт из колоды (как в солитёре при раскладке): полёт одной карты
+# и волна раздачи — задержка между картами (дальше N-й карты летят вместе)
+DEAL_FLIGHT_MS = 240
+DEAL_STAGGER_MS = 30
+DEAL_STAGGER_N = 14
+
 # папка пресетов (рядом с пакетом card_tester)
 PRESETS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                            'presets')
 # папка результатов запуска
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                           'output')
-
-# подключённые приборы стенда (порты определены сканированием VISA, *IDN? отвечают)
-DEFAULT_PS = {'model': 'DP832A',    # Rigol DP832 (прошивка отвечает как DP832A)
-              'port': 'USB0::0x1AB1::0x0E11::DP8B262201226::INSTR'}
-DEFAULT_MM = {'model': 'AKIP2101',  # AKIP-2101/2102-SC
-              'port': 'USB0::0xF4EC::0xEE38::SDM35GBD6R2181::INSTR'}
 
 
 # ---------------------------------------------------------------- значки
@@ -87,6 +93,19 @@ def _lighten(hex_color, f):
     g = int(c.green() + (255 - c.green()) * f)
     b = int(c.blue() + (255 - c.blue()) * f)
     return f'#{r:02x}{g:02x}{b:02x}'
+
+
+def _deck_type_of(obj):
+    """Стопка колоды, к которой относится вид, для анимации раздачи/сбора.
+
+    OFF летит из стопки ON (она общая), свип-карта — из группы «Система»;
+    у цикла стопки нет (None — выскакивает из центра колоды).
+    """
+    if isinstance(obj, Card):
+        return 'on' if obj.type == 'off' else obj.type
+    if isinstance(obj, SweepCard):
+        return 'sweep'
+    return None
 
 
 # ---------------------------------------------------------------- рисунок прибора
@@ -317,13 +336,21 @@ class CardRowWidget(QtWidgets.QWidget):
         # после apply_zoom шире minimumSizeHint (тот — статические минимумы
         # отсеков, без содержимого), и соседи должны отталкиваться от реальной
         # ширины, иначе наезжают друг на друга
-        if v.isVisible():
+        if not v.isHidden():
             return max(v.width(), 20)
+        # вид «летит» из колоды (раздача): место держится его реальным
+        # размером (_deal_size), а не минимумом — лента не вздрагивает
+        size = getattr(v, '_deal_size', None)
+        if size is not None:
+            return max(size.width(), 20)
         return max(v.minimumSizeHint().width(), 20)
 
     def _view_height(self, v):
-        if v.isVisible():
+        if not v.isHidden():
             return max(v.height(), 20)
+        size = getattr(v, '_deal_size', None)
+        if size is not None:
+            return max(size.height(), 20)
         return max(v.minimumSizeHint().height(), 20)
 
     def _active_views(self):
@@ -480,6 +507,9 @@ class ProgramItemView(QtWidgets.QFrame):
         self.win = win
         self._press_pos = None
         self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        # клик даёт карте фокус: Delete после клика удаляет её, а не правит
+        # текст в поле, где фокус был до этого
+        self.setFocusPolicy(QtCore.Qt.FocusPolicy.ClickFocus)
         self.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self._menu)
 
@@ -504,6 +534,7 @@ class ProgramItemView(QtWidgets.QFrame):
     # ------------------------------------------- мышь: выделение + перенос
     def mousePressEvent(self, ev):
         if ev.button() == QtCore.Qt.MouseButton.LeftButton:
+            self.setFocus()
             self._press_pos = mouse_pos(ev)
             self.win.on_item_clicked(self.obj.id, ev.modifiers())
         # клик принадлежит карте: не отдаём его жёлтой зоне цикла,
@@ -628,7 +659,8 @@ class CardView(ProgramItemView):
         p.setPen(QtGui.QPen(QtGui.QColor(color).darker(160), 1))
         p.setBrush(QtGui.QColor('#FAF7EE'))
         p.drawRoundedRect(art, 8, 8)
-        paint_instrument_art(p, art.adjusted(6, 5, -6, -5), card_icon(self.card))
+        paint_instrument_art(p, art.adjusted(6, 5, -6, -5),
+                             card_icon(self.card, self.win.devices))
 
         # тёмная панель параметров (как статы на КК)
         st = QtCore.QRectF(9, h - 64, w - 18, 44)
@@ -644,7 +676,7 @@ class CardView(ProgramItemView):
         align_r = int(QtCore.Qt.AlignmentFlag.AlignRight
                       | QtCore.Qt.AlignmentFlag.AlignVCenter)
         y = st.top() + 5
-        for label, value in stats_rows(self.card)[:3]:
+        for label, value in stats_rows(self.card, boxes=self.win.devices)[:3]:
             row = QtCore.QRectF(st.x() + 8, y, st.width() - 16, 12)
             p.setPen(QtGui.QPen(QtGui.QColor('#c9cdd4')))
             p.drawText(row, align_l, label)
@@ -665,7 +697,7 @@ class CardView(ProgramItemView):
         p.setFont(f3)
         p.drawText(QtCore.QRectF(0, h - 17, w, 13),
                    int(QtCore.Qt.AlignmentFlag.AlignCenter),
-                   card_device_label(self.card))
+                   card_device_label(self.card, self.win.devices))
 
     def _fill_menu(self, m, win):
         m.addAction('Дублировать', win.duplicate_selected)
@@ -862,29 +894,30 @@ class SweepView(ProgramItemView):
 
 
 # ---------------------------------------------------------------- колода
-# Стопки колоды по приборам: у каждого прибора свой набор стопок,
+# Стопки карт внутри коробки: у БП и Мультиметра свой набор,
 # карты отличаются рисунком прибора, но стиль один (Meas всегда зелёная).
-DECK_GROUPS = [
-    ('БП', [('set', 'Set', 'ps'), ('meas', 'Meas', 'ps'), ('on', 'ON/OFF', 'ps')]),
-    ('Мультиметр', [('meas', 'Meas', 'mm')]),
-    ('Система', [('delay', 'Delay', 'sys'), ('sweep', 'Свип', 'sweep')]),
-]
+BOX_STACKS = {
+    'ps': [('set', 'Set'), ('meas', 'Meas'), ('on', 'ON/OFF')],
+    'mm': [('meas', 'Meas')],
+}
 
 
 class StackWidget(QtWidgets.QFrame):
-    """Стопка вертикальных карт одного типа у прибора в колоде.
+    """Стопка вертикальных карт одного типа у коробки-прибора в колоде.
 
     Клик — добавить карту в конец программы; карту можно ВЗЯТЬ из стопки
     и ВЫЛОЖИТЬ на ленту/в цикл — за курсором летит «призрак» карты.
+    box — коробка-прибор стопки (None у карт «Системы»: Delay, Свип).
     """
 
     W, H = 112, 156
 
-    def __init__(self, card_type, title, device, win):
+    def __init__(self, card_type, title, box, win):
         super().__init__()
         self.card_type = card_type
         self.title = title
-        self.device = device              # прибор стопки ('ps'/'mm'/'sys')
+        self.box = box                    # коробка-прибор стопки (None — «Система»)
+        self.kind = box.kind if box is not None else 'sys'
         self.color = CATALOG[card_type]['color']
         self.win = win
         self._press = None
@@ -930,7 +963,7 @@ class StackWidget(QtWidgets.QFrame):
         p.setPen(QtGui.QPen(QtGui.QColor(self.color).darker(160), 1))
         p.setBrush(QtGui.QColor('#FAF7EE'))
         p.drawRoundedRect(art, 5, 5)
-        paint_instrument_art(p, art.adjusted(4, 3, -4, -3), self.device)
+        paint_instrument_art(p, art.adjusted(4, 3, -4, -3), self.kind)
         # мини-блок статов
         st = QtCore.QRectF(face.x() + 5, face.bottom() - 36, face.width() - 10, 30)
         p.setPen(QtCore.Qt.PenStyle.NoPen)
@@ -943,20 +976,18 @@ class StackWidget(QtWidgets.QFrame):
         p.drawText(QtCore.QRectF(st.x() + 4, st.y() + 2, st.width() - 8, 12),
                    int(QtCore.Qt.AlignmentFlag.AlignLeft
                        | QtCore.Qt.AlignmentFlag.AlignVCenter),
-                   'ПАРАМЕТРЫ')
+                   'ПРИБОР')
         p.drawText(QtCore.QRectF(st.x() + 4, st.y() + 15, st.width() - 8, 12),
                    int(QtCore.Qt.AlignmentFlag.AlignLeft
                        | QtCore.Qt.AlignmentFlag.AlignVCenter),
-                   card_device_label(new_card(self.card_type))
-                   if self.card_type != 'meas' else DEVICE_LABELS[self.device])
+                   DEVICE_LABELS['sys'] if self.box is None
+                   else device_display_name(self.box))
         f3 = p.font()
         f3.setPointSize(8)
         p.setFont(f3)
 
     def _drag_pixmap(self):
-        card = new_card(self.card_type)
-        if self.card_type == 'meas':
-            card.params['device'] = self.device
+        card = new_card(self.card_type, self.box)
         tmp = CardView(card, self.win)
         pix = tmp.grab()
         tmp.setParent(None)
@@ -977,8 +1008,7 @@ class StackWidget(QtWidgets.QFrame):
                 and (mouse_pos(ev) - self._press).manhattanLength() > 12):
             self._dragging = True
             self.win.begin_new_drag(self, self.card_type,
-                                    ev.globalPosition().toPoint(),
-                                    device=self.device)
+                                    ev.globalPosition().toPoint(), box=self.box)
             return
         super().mouseMoveEvent(ev)
 
@@ -988,8 +1018,124 @@ class StackWidget(QtWidgets.QFrame):
         self._dragging = False
         if (was_click and ev.button() == QtCore.Qt.MouseButton.LeftButton
                 and not self.win.running):
-            self.win.add_card(self.card_type, device=self.device)
+            self.win.add_card(self.card_type, box=self.box)
         super().mouseReleaseEvent(ev)
+
+
+# ---------------------------------------------------------------- коробки
+def box_qss(selected):
+    """Коробка в колоде: серая рамка вокруг стопок карт одного прибора
+    (без чисто белого — серый держит всю колоду в одном тоне)."""
+    border = '3px solid #F5B301' if selected else '1px solid #9ca3af'
+    top = '#e8eaee' if not selected else '#eef0f3'
+    bottom = '#c6cbd3' if not selected else '#d7dade'
+    return f"""
+    QFrame#deviceBox {{
+        background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+            stop:0 {top}, stop:1 {bottom});
+        border: {border}; border-radius: 12px; }}
+    QLabel#deviceBoxCaption {{ color: #374151; font-weight: bold; font-size: 8pt;
+        border: none; background: transparent; }}
+    """
+
+
+class DeviceBoxWidget(QtWidgets.QFrame):
+    """Коробка в колоде: один прибор = свой набор стопок карт.
+
+    Клик по коробке (фону или подписи) — выделение: справа появляются
+    настройки прибора (модель и адрес). ПКМ — меню (настройки справа /
+    удалить; Delete работает на выделенную коробку). Клик по стопке —
+    добавить карту, как раньше. Системные карты (Delay, Свип) лежат вне
+    коробок.
+    """
+
+    def __init__(self, box, win):
+        super().__init__()
+        self.box = box
+        self.win = win
+        self.setObjectName('deviceBox')
+        self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        # клик даёт коробке фокус: Delete после клика удаляет её,
+        # а не правит текст в поле, где фокус был до этого
+        self.setFocusPolicy(QtCore.Qt.FocusPolicy.ClickFocus)
+        self.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._menu)
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setContentsMargins(8, 4, 8, 6)
+        lay.setSpacing(3)
+        self.caption = QtWidgets.QLabel(
+            f'{DEVICE_KIND_TITLES[box.kind]} · {device_title(box, win.devices)}')
+        self.caption.setObjectName('deviceBoxCaption')
+        self.caption.setFixedHeight(16)
+        lay.addWidget(self.caption)
+        row = QtWidgets.QHBoxLayout()
+        row.setSpacing(8)
+        for card_type, title in BOX_STACKS[box.kind]:
+            st = StackWidget(card_type, title, box, win)
+            st.setFixedSize(StackWidget.W, StackWidget.H)
+            st.setToolTip(describe(new_card(card_type, box), None, (box,)))
+            row.addWidget(st)
+        lay.addLayout(row)
+        self.refresh_style()
+
+    def refresh_style(self):
+        self.setStyleSheet(box_qss(self.win.is_box_selected(self.box.id)))
+
+    def mousePressEvent(self, ev):
+        if ev.button() == QtCore.Qt.MouseButton.LeftButton:
+            self.setFocus()
+            self.win.on_box_clicked(self.box.id)
+        ev.accept()
+
+    def _menu(self, pos):
+        """ПКМ по коробке: настройки справа или удалить."""
+        self.win.on_box_clicked(self.box.id)
+        m = QtWidgets.QMenu(self)
+        m.addAction('Настройки справа', lambda: self.win.on_box_clicked(self.box.id))
+        m.addSeparator()
+        m.addAction('Удалить', lambda: self.win.delete_box(self.box))
+        m.popup(self.mapToGlobal(pos))
+
+
+class AddBoxDialog(QtWidgets.QDialog):
+    """Всплывающее окно кнопки «+»: какую коробку добавить (БП или мультиметр).
+
+    Модель и адрес выбираются потом — кликом по новой коробке (настройки
+    справа), поэтому в окне только выбор типа прибора.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle('Новая коробка')
+        self.kind = None
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.setSpacing(10)
+        lab = QtWidgets.QLabel('Какой прибор положить в новую коробку?')
+        lab.setWordWrap(True)
+        f = lab.font()
+        f.setBold(True)
+        lab.setFont(f)
+        lay.addWidget(lab)
+        hint = QtWidgets.QLabel('Модель и адрес выбираются после: кликните '
+                                'коробку — настройки справа.')
+        hint.setWordWrap(True)
+        lay.addWidget(hint)
+        for kind, text, color in (
+                ('ps', '⚡ БП — источник питания', '#2f6fd6'),
+                ('mm', 'Мультиметр', '#1e9e5a')):
+            btn = QtWidgets.QPushButton(text)
+            btn.setFixedHeight(36)
+            btn.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+            btn.setStyleSheet(f"""
+                QPushButton {{ background: {color}; color: white; font-weight: bold;
+                    border: none; border-radius: 8px; padding: 0 14px; }}
+                QPushButton:hover {{ border: 2px solid #F5B301; }}""")
+            btn.clicked.connect(lambda _=False, k=kind: self._pick(k))
+            lay.addWidget(btn)
+
+    def _pick(self, kind):
+        self.kind = kind
+        self.accept()
 
 
 # ---------------------------------------------------------------- график
@@ -1302,6 +1448,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.selected = set()       # id выделенных карт
         self.anchor_id = None
         self.views = {}             # id -> виджет
+        self.devices = [            # коробки-приборы: каждый набор карт — своя коробка
+            DeviceBox(kind='ps', model=DEFAULT_PS['model'], port=DEFAULT_PS['port']),
+            DeviceBox(kind='mm', model=DEFAULT_MM['model'], port=DEFAULT_MM['port']),
+        ]
+        self.selected_box_id = None  # выделенная коробка в колоде (настройки справа)
+        self._box_widgets = []       # виджеты коробок в колоде
+        self._check_buttons = []     # кнопки «Проверить (*IDN?)» панели настроек
         self.running = False
         self._run_thread = None
         self._idn_threads = {}
@@ -1309,6 +1462,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._deck_hover = False    # курсор над колодой: «положить = удалить»
         self._rows = []             # все CardRowWidget (верхняя + тела циклов)
         self._mdrag = None          # ручное перетаскивание (карта «в руке»)
+        self._deal_pending = []     # виды, ждущие полёта из колоды (раздача)
+        self._deal_ghosts = []      # летящие карты-«призраки» (раздача/сбор)
         self.constants = [{'name': 'Vcc', 'value': '3.3'}]   # общие константы
         self._completer_models = []   # модели подсказок (обновляются при правке констант)
         self._combo_editors = []      # редактируемые списки значений в параметрах
@@ -1346,48 +1501,25 @@ class MainWindow(QtWidgets.QMainWindow):
         tb.addAction(self.act_open)
 
     def _build_docks(self):
-        self._build_connection_panel()   # self.conn_box — в левую панель
-
-        # --- константы и подключение (слева) ---
-        self.left_dock = QtWidgets.QDockWidget('Константы и подключение', self)
+        # --- константы (слева) ---
+        self.left_dock = QtWidgets.QDockWidget('Константы', self)
         self.left_dock.setFeatures(QtWidgets.QDockWidget.DockWidgetFeature.DockWidgetMovable)
         left_child = QtWidgets.QWidget()
         left_lay = QtWidgets.QVBoxLayout(left_child)
         left_lay.setSpacing(8)
         left_lay.addWidget(self._build_constants_panel())
-        left_lay.addWidget(self.conn_box)
         left_lay.addStretch(1)
         self.left_dock.setWidget(self._vscroll(left_child))
         self.addDockWidget(QtCore.Qt.DockWidgetArea.LeftDockWidgetArea, self.left_dock)
 
-        # --- колода (снизу у стола): у каждого прибора свои стопки ---
+        # --- колода (снизу у стола): коробка на каждый прибор ---
         self.deck_dock = QtWidgets.QDockWidget('Колода', self)
         self.deck_dock.setFeatures(QtWidgets.QDockWidget.DockWidgetFeature.DockWidgetMovable)
         deck_child = QtWidgets.QWidget()
-        deck_lay = QtWidgets.QHBoxLayout(deck_child)
-        deck_lay.setContentsMargins(8, 4, 8, 4)
-        deck_lay.setSpacing(20)
-        self.deck_buttons = []
-        for gtitle, stacks in DECK_GROUPS:
-            col = QtWidgets.QVBoxLayout()
-            col.setSpacing(3)
-            cap = QtWidgets.QLabel(f'<b>{gtitle}</b>')
-            cap.setStyleSheet('color: #6b7280;')
-            col.addWidget(cap)
-            row = QtWidgets.QHBoxLayout()
-            row.setSpacing(8)
-            for card_type, stack_title, device in stacks:
-                st = StackWidget(card_type, stack_title, device, self)
-                st.setFixedSize(StackWidget.W, StackWidget.H)
-                st.setToolTip(describe(new_card(card_type)))
-                row.addWidget(st)
-                self.deck_buttons.append(st)
-            col.addLayout(row)
-            col.addStretch(1)
-            wrap = QtWidgets.QWidget()
-            wrap.setLayout(col)
-            deck_lay.addWidget(wrap)
-        deck_lay.addStretch(1)
+        self.deck_lay = QtWidgets.QHBoxLayout(deck_child)
+        self.deck_lay.setContentsMargins(8, 4, 8, 4)
+        self.deck_lay.setSpacing(12)
+        self.rebuild_deck()
         # колода тоже скроллится колесом, если окно узкое
         self._deck_area = QtWidgets.QScrollArea()
         self._deck_area.setWidgetResizable(True)
@@ -1397,16 +1529,20 @@ class MainWindow(QtWidgets.QMainWindow):
         self._deck_area.setWidget(deck_child)
         self.deck_dock.setWidget(self._deck_area)
         self.addDockWidget(QtCore.Qt.DockWidgetArea.BottomDockWidgetArea, self.deck_dock)
-        self.resizeDocks([self.deck_dock], [210], QtCore.Qt.Orientation.Vertical)
+        self.resizeDocks([self.deck_dock], [250], QtCore.Qt.Orientation.Vertical)
 
         # --- параметры (справа): только выбранная карта / цикл ---
         self.params_dock = QtWidgets.QDockWidget('Параметры', self)
         self.params_dock.setFeatures(QtWidgets.QDockWidget.DockWidgetFeature.DockWidgetMovable)
         params_child = QtWidgets.QWidget()
+        # панель не сжимается в нечитаемую щель: QLabel с переносом даёт
+        # крошечный sizeHint, и при открытии док сворачивался до ~70 px
+        params_child.setMinimumWidth(280)
         self.params_lay = QtWidgets.QVBoxLayout(params_child)
         self.params_lay.setSpacing(8)
         self.params_dock.setWidget(self._vscroll(params_child))
         self.addDockWidget(QtCore.Qt.DockWidgetArea.RightDockWidgetArea, self.params_dock)
+        self.resizeDocks([self.params_dock], [340], QtCore.Qt.Orientation.Horizontal)
 
         # --- лента программы (центр) ---
         self._strip_area = QtWidgets.QScrollArea()
@@ -1416,10 +1552,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self._strip_area.setWidget(self.strip)
         self.setCentralWidget(self._strip_area)
 
+        # Delete: удалить выделенную коробку (колоду) или выделенные карты —
+        # на всё окно, чтобы работало при выделенной коробке в колоде
+        # (см. on_delete_key: фокус в поле ввода — Delete редактирует текст)
         sc = QShortcut(
-            QtGui.QKeySequence(QtGui.QKeySequence.StandardKey.Delete), self._strip_area)
-        sc.setContext(QtCore.Qt.ShortcutContext.WidgetWithChildrenShortcut)
-        sc.activated.connect(self.delete_selection)
+            QtGui.QKeySequence(QtGui.QKeySequence.StandardKey.Delete), self)
+        sc.setContext(QtCore.Qt.ShortcutContext.WindowShortcut)
+        sc.activated.connect(self.on_delete_key)
         sc_esc = QShortcut(QtGui.QKeySequence('Escape'), self._strip_area)
         sc_esc.setContext(QtCore.Qt.ShortcutContext.WidgetWithChildrenShortcut)
         sc_esc.activated.connect(self.clear_selection)
@@ -1491,42 +1630,185 @@ class MainWindow(QtWidgets.QMainWindow):
             r.relayout()
         self.status.setText(f'Масштаб программы: {int(round(z * 100))}%')
 
-    def _build_connection_panel(self):
-        """Панель подключения (модель + порт под каждый прибор) — слева."""
-        box = QtWidgets.QGroupBox('Подключение')
-        form = QtWidgets.QFormLayout(box)
+    # ---------------------------------------------------------------- коробки
+    def rebuild_deck(self):
+        """Пересобирает колоду: своя коробка на каждый прибор, кнопка «+»
+        добавить коробку и общая группа «Система» (Delay, Свип)."""
+        self._purge_layout(self.deck_lay)
+        self._box_widgets = []
+        self.deck_buttons = []
+        for box in self.devices:
+            w = DeviceBoxWidget(box, self)
+            self._box_widgets.append(w)
+            self.deck_lay.addWidget(w)
+            self.deck_buttons += [
+                st for st in w.findChildren(StackWidget)]
+        # «Система» — не коробка: общие карты без прибора
+        sys_frame = QtWidgets.QFrame()
+        sys_frame.setObjectName('deviceBox')
+        sys_lay = QtWidgets.QVBoxLayout(sys_frame)
+        sys_lay.setContentsMargins(8, 4, 8, 6)
+        sys_lay.setSpacing(3)
+        cap = QtWidgets.QLabel('Система')
+        cap.setObjectName('deviceBoxCaption')
+        cap.setFixedHeight(16)
+        sys_lay.addWidget(cap)
+        row = QtWidgets.QHBoxLayout()
+        row.setSpacing(8)
+        for card_type, title in (('delay', 'Delay'), ('sweep', 'Свип')):
+            st = StackWidget(card_type, title, None, self)
+            st.setFixedSize(StackWidget.W, StackWidget.H)
+            st.setToolTip(describe(new_card(card_type)))
+            row.addWidget(st)
+            self.deck_buttons.append(st)
+        sys_lay.addLayout(row)
+        sys_frame.setStyleSheet(box_qss(False))
+        self.deck_lay.addWidget(sys_frame)
+        # кнопка «+»: всплывающее окно добавления коробки (БП или мультиметр)
+        btn_add = QtWidgets.QToolButton()
+        btn_add.setText('+')
+        btn_add.setToolTip('Добавить коробку-прибор: свой набор карт, '
+                           'модель и адрес настраиваются кликом по коробке')
+        btn_add.setFixedSize(StackWidget.W, StackWidget.H)
+        btn_add.setStyleSheet("""
+            QToolButton { background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
+                stop:0 #e8eaee, stop:1 #c6cbd3); color: #4b5563; font-size: 30pt;
+                font-weight: bold; border: 2px dashed #9ca3af; border-radius: 12px; }
+            QToolButton:hover { border-color: #F5B301; color: #111827; }
+            QToolButton:pressed { background: #c6cbd3; }""")
+        btn_add.clicked.connect(self.add_box)
+        self.deck_lay.addWidget(btn_add)
+        self.deck_lay.addStretch(1)
 
-        self.cb_ps = QtWidgets.QComboBox()
-        self.cb_ps.addItems(PS_MODELS)
-        self.cb_ps.setCurrentText(DEFAULT_PS['model'])
-        self.ed_ps_port = QtWidgets.QLineEdit(DEFAULT_PS['port'])
-        self.btn_ps_check = QtWidgets.QPushButton('Проверить (*IDN?)')
-        self.btn_ps_check.clicked.connect(lambda: self.check_connection('ps'))
-        form.addRow('БП (модель)', self.cb_ps)
-        h1 = QtWidgets.QHBoxLayout()
-        h1.addWidget(self.ed_ps_port)
-        h1.addWidget(self.btn_ps_check)
-        form.addRow('БП порт', h1)
+    def first_box(self, kind):
+        """Первая коробка данного типа (для карт из старых файлов)."""
+        return next((b for b in self.devices if b.kind == kind), None)
 
-        self.cb_mm = QtWidgets.QComboBox()
-        self.cb_mm.addItems(MM_MODELS)
-        self.cb_mm.setCurrentText(DEFAULT_MM['model'])
-        self.ed_mm_port = QtWidgets.QLineEdit(DEFAULT_MM['port'])
-        self.btn_mm_check = QtWidgets.QPushButton('Проверить (*IDN?)')
-        self.btn_mm_check.clicked.connect(lambda: self.check_connection('mm'))
-        form.addRow('ММ (модель)', self.cb_mm)
-        h2 = QtWidgets.QHBoxLayout()
-        h2.addWidget(self.ed_mm_port)
-        h2.addWidget(self.btn_mm_check)
-        form.addRow('ММ порт', h2)
+    def is_box_selected(self, box_id):
+        return self.selected_box_id == box_id
 
-        hint = QtWidgets.QLabel('Настроен стенд: БП Rigol DP832A + мультиметр AKIP-2101 '
-                                '(VISA-адреса определены автоматически). '
-                                'Порт test_float — виртуальный режим без железа.')
-        hint.setWordWrap(True)
-        form.addRow(hint)
+    def refresh_deck_styles(self):
+        for w in self._box_widgets:
+            w.refresh_style()
 
-        self.conn_box = box
+    def on_box_clicked(self, box_id):
+        """Клик по коробке: выделить её, справа — настройки прибора."""
+        self.selected_box_id = box_id
+        self.selected = set()
+        self.anchor_id = None
+        self.refresh_deck_styles()
+        self.update_selection()
+        self.rebuild_params()
+        self.update_actions()
+
+    def add_box(self):
+        """Кнопка «+»: всплывающее окно выбора типа прибора, затем новая
+        коробка (модель и адрес — справа, кликом по коробке)."""
+        if self.running:
+            return
+        dlg = AddBoxDialog(self)
+        if hasattr(dlg, 'exec'):          # PyQt5: только exec_()
+            dlg.exec()
+        else:
+            dlg.exec_()
+        if dlg.kind is None:
+            return
+        models = PS_MODELS if dlg.kind == 'ps' else MM_MODELS
+        box = DeviceBox(kind=dlg.kind, model=models[0], port='')
+        self.devices.append(box)
+        self.rebuild_deck()
+        self.on_box_clicked(box.id)
+        self.append_log(f'Добавлена коробка: {DEVICE_KIND_TITLES[dlg.kind]} — '
+                        'выберите модель и адрес справа', 'info')
+
+    def on_delete_key(self):
+        """Delete: удалить выделенную коробку в колоде или выделенные карты.
+
+        Если фокус в поле ввода — Delete редактирует текст, ничего не
+        удаляем.
+        """
+        fw = QtWidgets.QApplication.focusWidget()
+        if isinstance(fw, (QtWidgets.QLineEdit, QtWidgets.QComboBox,
+                           QtWidgets.QPlainTextEdit, QtWidgets.QAbstractSpinBox)):
+            return
+        if self.selected_box_id is not None:
+            box = find_box(self.devices, self.selected_box_id)
+            if box is not None:
+                self.delete_box(box)
+            return
+        self.delete_selection()
+
+    def delete_box(self, box):
+        """Удалить коробку вместе со всеми её картами.
+
+        Карты коробки убираются по всей программе (в циклах и отсеках
+        свипов тоже); пара ON/OFF удаляется вместе, чтобы включение не
+        осталось без выключения.
+        """
+        if self.running:
+            return
+        ids = expand_on_off_pairs(self.sequence, self._box_card_ids(box.id))
+        n = remove_items(self.sequence, ids)
+        self.selected = set()
+        self.anchor_id = None
+        if self.selected_box_id == box.id:
+            self.selected_box_id = None
+        self.devices.remove(box)
+        self.rebuild_deck()
+        self.rebuild_strip(return_ids=ids)    # карты коробки — обратно в колоду
+        self.rebuild_params()
+        self.update_actions()
+        title = f'{DEVICE_KIND_TITLES.get(box.kind, "")} {device_display_name(box)}'
+        self.append_log(f'Коробка удалена: {title}'
+                        + (f' · карт удалено: {n}' if n else ''), 'info')
+
+    def _box_card_ids(self, box_id):
+        """id всех карт коробки в программе (в циклах и отсеках свипов тоже)."""
+        ids = set()
+
+        def walk(lst):
+            for it in lst:
+                if isinstance(it, ForLoop):
+                    walk(it.children)
+                elif isinstance(it, SweepCard):
+                    for _role, sub in sweep_bays(it):
+                        walk(sub)
+                elif isinstance(it, Card) and it.type in DEVICE_CARD_TYPES \
+                        and it.params.get('device') == box_id:
+                    ids.add(it.id)
+
+        walk(self.sequence)
+        return ids
+
+    def _migrate_device_ids(self, seq):
+        """Карты из старых файлов: «ps»/«mm» или чужой id → id коробки.
+
+        Если коробки нужного типа нет — она создаётся (адрес пустой:
+        пользователь заполнит в настройках коробки).
+        """
+        def box_for(kind):
+            b = self.first_box(kind)
+            if b is None:
+                b = DeviceBox(kind=kind,
+                              model=(PS_MODELS if kind == 'ps' else MM_MODELS)[0],
+                              port='')
+                self.devices.append(b)
+            return b
+
+        def walk(lst):
+            for it in lst:
+                if isinstance(it, ForLoop):
+                    walk(it.children)
+                elif isinstance(it, SweepCard):
+                    for _role, sub in sweep_bays(it):
+                        walk(sub)
+                elif isinstance(it, Card) and it.type in DEVICE_CARD_TYPES:
+                    dev = it.params.get('device', '')
+                    if find_box(self.devices, dev) is None:
+                        kind = 'mm' if dev == 'mm' else 'ps'
+                        it.params['device'] = box_for(kind).id
+
+        walk(seq)
 
     # ---------------------------------------------------------------- константы
     def _build_constants_panel(self):
@@ -1623,14 +1905,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.statusBar().addPermanentWidget(self.run_btn)
 
     def _apply_example(self):
+        ps = self.first_box('ps')
         self.sequence[:] = [
-            new_card('set'),
-            new_card('on'),
-            new_card('off'),
+            new_card('set', ps),
+            new_card('on', ps),
+            new_card('off', ps),
             new_card('delay'),
-            new_card('meas'),
+            new_card('meas', ps),
         ]
-        self.rebuild_strip()
+        self.rebuild_strip(deal_ids=[it.id for it in self.sequence])
         self.rebuild_params()
         self.append_log('Пример программы создан. Возьмите карту из стопки колоды '
                         'мышью и выложите на ленту или в цикл.', 'info')
@@ -1653,7 +1936,14 @@ class MainWindow(QtWidgets.QMainWindow):
         self.views[item.id] = v
         return v
 
-    def rebuild_strip(self):
+    def rebuild_strip(self, deal_ids=None, return_ids=frozenset()):
+        """Пересборка ленты. deal_ids — id видов, которые «раздаются» из
+        колоды (анимация как в солитёре при раскладке: клик по стопке —
+        новые карты, загрузка пресета — все верхние элементы); None —
+        обычная пересборка без раздачи. return_ids — id удалённых карт:
+        их снимки улетают обратно в колоду."""
+        self._cancel_deal()
+        returning = self._capture_returning(return_ids)
         self.views = {}
         self._rows = []
         self._hover_row = None
@@ -1661,12 +1951,195 @@ class MainWindow(QtWidgets.QMainWindow):
         self._rows.append(self.strip)
         self.strip.set_items(top_views)
         self.update_selection()
+        if returning:
+            self._start_return(returning)
+        if deal_ids:
+            self._prepare_deal(deal_ids)
+
+    # ------------------------------------------------- раздача из колоды
+    def _cancel_deal(self):
+        """Остановить прошлую раздачу/сбор: пересборка убивает её виды."""
+        self._deal_pending = []
+        for g in self._deal_ghosts:
+            g.deleteLater()
+        self._deal_ghosts = []
+
+    def _top_views(self, ids):
+        """Виды-верхушки для раздачи из ids: карты внутри летящего кадра
+        цикла/свипа не раздаются отдельно — летят вместе с ним."""
+        return [v for v in self._raw_top_views() if v.obj.id in ids]
+
+    def _raw_top_views(self):
+        """Виды, у которых ни один предок не является видом (верхушки)."""
+        cand = [v for row in self._rows for v in row._views]
+        cset = set(cand)
+        out = []
+        for v in cand:
+            w = v.parentWidget()
+            while w is not None and w not in cset:
+                w = w.parentWidget()
+            if w is None:
+                out.append(v)
+        return out
+
+    def _capture_returning(self, ids):
+        """Снимки удаляемых карт до пересборки: (pixmap, позиция, карта)."""
+        out = []
+        if not ids:
+            return out
+        for row in self._rows:
+            for v in row._views:
+                if isinstance(v, CardView) and v.obj.id in ids:
+                    try:
+                        out.append((v.grab(),
+                                    v.mapToGlobal(QtCore.QPoint(0, 0)), v.obj))
+                    except RuntimeError:
+                        pass
+        return out
+
+    def _prepare_deal(self, ids):
+        """Новые карты «раздаются» из колоды: снимок каждого вида-верхушки,
+        вид прячется (место держит _deal_size); полёт стартует отложенно —
+        после прокрутки ленты вызывающим кодом."""
+        pending = []
+        for v in self._top_views(ids):
+            try:
+                pm = v.grab()               # снимаем, пока вид ещё показан
+            except RuntimeError:
+                continue
+            v._deal_size = v.size()
+            v.hide()
+            pending.append((v, pm))
+        if not pending:
+            return
+        self._deal_pending = pending
+        QtCore.QTimer.singleShot(0, self._start_deal)
+
+    def _start_deal(self):
+        pending, self._deal_pending = self._deal_pending, []
+        for i, (v, pm) in enumerate(pending):
+            delay = min(i, DEAL_STAGGER_N) * DEAL_STAGGER_MS
+            QtCore.QTimer.singleShot(delay, lambda v=v, pm=pm: self._fly_deal(v, pm))
+
+    def _start_return(self, captured):
+        """Удалённые карты улетают обратно в колоду (снимки уже сняты)."""
+        for i, (pm, gpos, obj) in enumerate(captured):
+            delay = min(i, DEAL_STAGGER_N) * DEAL_STAGGER_MS
+            QtCore.QTimer.singleShot(
+                delay, lambda pm=pm, gpos=gpos, obj=obj: self._fly_return(pm, gpos, obj))
+
+    def _fly_deal(self, v, pm):
+        try:
+            end = QtCore.QRect(v.mapToGlobal(QtCore.QPoint(0, 0)), v.size())
+        except RuntimeError:
+            return
+        self._fly(pm, self._deck_source_rect(v.obj, end), end, deal=True, view=v)
+
+    def _fly_return(self, pm, gpos, obj):
+        start = QtCore.QRect(gpos, pm.size())
+        self._fly(pm, start, self._deck_source_rect(obj, start), deal=False)
+
+    def _deck_stack_for_obj(self, obj):
+        """Стопка колоды, из которой вид «выскакивает»/в которую возвращается.
+
+        Своя коробка → другая коробка того же вида прибора (например, после
+        удаления коробки) → любая стопка этого типа → None (цикл).
+        """
+        t = _deck_type_of(obj)
+        if t is None:
+            return None
+        box = find_box(self.devices, obj.params.get('device', '')) \
+            if isinstance(obj, Card) else None
+        same = [st for st in self.deck_buttons if st.card_type == t]
+        for st in same:                     # своя коробка (у «Системы» box=None)
+            if st.box is box:
+                return st
+        if box is not None:
+            for st in same:                 # другая коробка того же вида
+                if st.box is not None and st.box.kind == box.kind:
+                    return st
+        return same[0] if same else None
+
+    def _deck_face(self, obj):
+        """Глобальный прямоугольник «лица» стопки (откуда выскакивает карта)."""
+        st = self._deck_stack_for_obj(obj)
+        if st is not None and st.isVisible():
+            return QtCore.QRect(st.mapToGlobal(QtCore.QPoint(4, 4)),
+                                QtCore.QSize(StackWidget.W - 16, StackWidget.H - 22))
+        # стопки нет (коробки с такими картами больше нет) — центр колоды
+        anchor = self.deck_dock if self.deck_dock.isVisible() else self
+        c = anchor.mapToGlobal(anchor.rect().center())
+        return QtCore.QRect(c.x() - 48, c.y() - 67, 96, 134)
+
+    def _deck_source_rect(self, obj, card_rect):
+        """Прямоугольник «карты в стопке»: лицо стопки, но не крупнее карты —
+        при уменьшенном масштабе карта выскакивает своего размера."""
+        face = self._deck_face(obj)
+        w = min(face.width(), int(card_rect.width() * 1.2))
+        h = min(face.height(), int(card_rect.height() * 1.2))
+        return QtCore.QRect(face.center().x() - w // 2,
+                            face.center().y() - h // 2, w, h)
+
+    def _fly(self, pm, start, end, deal, view=None):
+        """Полёт карты-«призрака» из прямоугольника start в end (глобальные).
+
+        deal=True — выскакивает из колоды: растёт, проявляется и на месте
+        «сменяется» настоящим видом; deal=False — улетает в колоду: сжимается
+        и гаснет. Призрак — независимое окно и переживает пересборку ленты.
+        """
+        ghost = QtWidgets.QLabel(None, QtCore.Qt.WindowType.ToolTip
+                                 | QtCore.Qt.WindowType.FramelessWindowHint
+                                 | QtCore.Qt.WindowType.WindowStaysOnTopHint)
+        ghost.setAttribute(QtCore.Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+        ghost.setAttribute(QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+        ghost.setPixmap(pm)
+        ghost.setScaledContents(True)
+        ghost.setGraphicsEffect(QtWidgets.QGraphicsOpacityEffect(ghost))
+        ghost.setGeometry(start)
+        ghost.show()
+        self._deal_ghosts.append(ghost)
+        grp = QtCore.QParallelAnimationGroup(ghost)
+        move = QtCore.QPropertyAnimation(ghost, b'geometry', grp)
+        move.setDuration(DEAL_FLIGHT_MS)
+        move.setStartValue(QtCore.QRect(start))
+        move.setEndValue(QtCore.QRect(end))
+        move.setEasingCurve(QtCore.QEasingCurve.Type.OutCubic)
+        fade = QtCore.QPropertyAnimation(ghost.graphicsEffect(), b'opacity', grp)
+        fade.setDuration(DEAL_FLIGHT_MS)
+        if deal:
+            fade.setStartValue(0.0)
+            fade.setKeyValueAt(0.4, 1.0)
+            fade.setEndValue(1.0)
+        else:
+            fade.setStartValue(1.0)
+            fade.setKeyValueAt(0.6, 1.0)
+            fade.setEndValue(0.0)
+        grp.addAnimation(move)
+        grp.addAnimation(fade)
+
+        def done():
+            try:
+                if view is not None:
+                    view.show()
+                    if hasattr(view, '_deal_size'):
+                        del view._deal_size
+            except RuntimeError:
+                pass
+            ghost.deleteLater()
+            if ghost in self._deal_ghosts:
+                self._deal_ghosts.remove(ghost)
+
+        grp.finished.connect(done)
+        grp.start()
 
     # ---------------------------------------------------------------- выбор
     def is_selected(self, item_id):
         return item_id in self.selected
 
     def on_item_clicked(self, item_id, modifiers):
+        if self.selected_box_id is not None:
+            self.selected_box_id = None
+            self.refresh_deck_styles()
         ctrl = bool(modifiers & QtCore.Qt.KeyboardModifier.ControlModifier)
         shift = bool(modifiers & QtCore.Qt.KeyboardModifier.ShiftModifier)
         top_ids = [it.id for it in self.sequence]
@@ -1688,6 +2161,8 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def clear_selection(self):
         self.selected = set()
+        self.selected_box_id = None
+        self.refresh_deck_styles()
         self.update_selection()
         self.rebuild_params()
         self.update_actions()
@@ -1697,32 +2172,37 @@ class MainWindow(QtWidgets.QMainWindow):
             v.refresh_style()
 
     # ---------------------------------------------------------------- действия
-    def add_card(self, card_type, device=None):
-        """Клик по стопке колоды: карта добавляется в конец (ON авт. везёт OFF)."""
-        self.add_card_at(self.sequence, len(self.sequence), card_type, device)
+    def add_card(self, card_type, box=None):
+        """Клик по стопке колоды: карта «выскакивает» из стопки в конец
+        программы (ON авт. везёт OFF)."""
+        self.add_card_at(self.sequence, len(self.sequence), card_type, box,
+                         deal=True)
         sb = self._strip_area.horizontalScrollBar()
         sb.setValue(sb.maximum())
 
-    def add_card_at(self, container, index, card_type, device=None):
+    def add_card_at(self, container, index, card_type, box=None, deal=False):
         """Выкладывание карты в строку (drag-drop или клик).
 
-        device — прибор для Meas-карты (из какой стопки взяли).
-        При выкладывании ON рядом автоматически кладётся OFF.
+        box — коробка-прибор, из стопки которой взяли карту: она записывается
+        в params['device'] карты. При выкладывании ON рядом автоматически
+        кладётся OFF. deal — карта «выскакивает» из стопки колоды (клик по
+        стопке); при перетаскивании из колоды призрак уже летит за курсором,
+        раздача не нужна.
         """
         if self.running:
             return
         if card_type == 'sweep':
             cards = [SweepCard()]           # настройки От/До/Шаг — справа
         else:
-            cards = [new_card(card_type, device)]
+            cards = [new_card(card_type, box)]
             if card_type == 'on':
-                cards.append(new_card('off'))
+                cards.append(new_card('off', box))
         index = max(0, min(index, len(container)))
         for k, c in enumerate(cards):
             container.insert(index + k, c)
         self.selected = {cards[0].id}
         self.anchor_id = cards[0].id
-        self.rebuild_strip()
+        self.rebuild_strip(deal_ids=[c.id for c in cards] if deal else None)
         self.rebuild_params()
         self.update_actions()
 
@@ -1733,7 +2213,7 @@ class MainWindow(QtWidgets.QMainWindow):
         n = remove_items(self.sequence, ids)
         self.selected = set()
         self.anchor_id = None
-        self.rebuild_strip()
+        self.rebuild_strip(return_ids=ids)    # карты улетают обратно в колоду
         self.rebuild_params()
         self.update_actions()
         self.status.setText(f'Удалено карт: {n}')
@@ -1834,7 +2314,7 @@ class MainWindow(QtWidgets.QMainWindow):
         view.setGraphicsEffect(eff)
         self.grabMouse()
 
-    def begin_new_drag(self, btn, card_type, press_global, device=None):
+    def begin_new_drag(self, btn, card_type, press_global, box=None):
         """Карту «взяли» из колоды — выкладываем на ленту/в цикл."""
         if self.running or self._mdrag is not None:
             return
@@ -1842,7 +2322,7 @@ class MainWindow(QtWidgets.QMainWindow):
         pm = btn._drag_pixmap()
         offset = QtCore.QPoint(min(max(offset.x(), 0), pm.width()),
                                min(max(offset.y(), 0), pm.height()))
-        state = {'kind': 'new', 'card_type': card_type, 'device': device,
+        state = {'kind': 'new', 'card_type': card_type, 'box': box,
                  'is_loop': False, 'pm_orig': pm,
                  'ghost': self._make_ghost(pm, press_global, offset),
                  'offset': offset}
@@ -1957,7 +2437,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self._drop_delete(st)
             return
         if st['kind'] == 'new':
-            self.add_card_at(row.container, idx, st['card_type'], st.get('device'))
+            self.add_card_at(row.container, idx, st['card_type'], st.get('box'))
         else:
             self.move_item(st['id'], row.container, idx)
 
@@ -2019,7 +2499,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.rebuild_params()
         self.update_actions()
         self.status.setText(f'Карта убрана в колоду (удалено: {n})')
-        self.append_log(f'Удалено перетаскиванием в колоду: {describe(item)}'
+        self.append_log(f'Удалено перетаскиванием в колоду: {describe(item, None, self.devices)}'
                         + (' (вместе с парой ON/OFF)' if n > 1 else ''), 'info')
 
     def mouseMoveEvent(self, ev):
@@ -2125,12 +2605,24 @@ class MainWindow(QtWidgets.QMainWindow):
     def rebuild_params(self):
         self._clear_params()
 
+        # выделена коробка в колоде — справа настройки прибора
+        if self.selected_box_id is not None:
+            box = find_box(self.devices, self.selected_box_id)
+            if box is None:
+                self.selected_box_id = None
+            else:
+                self._build_device_params(box)
+                self.params_lay.addStretch(1)
+                return
+
         items = [self._resolve(i) for i in self.selected]
         items = [it for it in items if it is not None]
 
         if not items:
             lab = QtWidgets.QLabel('Карта не выбрана.\n\nКликните карту в программе — '
-                                   'здесь появятся её настройки.')
+                                   'здесь появятся её настройки.\n\nКликните коробку '
+                                   'в колоде (внизу) — настройки прибора: модель '
+                                   'и адрес.')
             lab.setWordWrap(True)
             self.params_lay.addWidget(lab)
         elif len(items) == 1 and isinstance(items[0], Card):
@@ -2146,10 +2638,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self.params_lay.addWidget(lab)
             for it in items[:12]:
                 if isinstance(it, Card):
-                    self.params_lay.addWidget(QtWidgets.QLabel('• ' + describe(it)))
+                    self.params_lay.addWidget(QtWidgets.QLabel(
+                        '• ' + describe(it, None, self.devices)))
         self.params_lay.addStretch(1)
 
     def _clear_params(self):
+        self._check_buttons = []
         lay = self.params_lay
         while lay.count():
             item = lay.takeAt(0)
@@ -2235,21 +2729,60 @@ class MainWindow(QtWidgets.QMainWindow):
             lambda text, k=key, c=card: self._param_changed(c, k, text))
         return cb
 
+    def _device_combo(self, card):
+        """Выбор коробки-прибора для карты (в списке — коробки нужного типа).
+
+        Meas-карту можно перепривязать и на БП, и на мультиметр; Set/ON/OFF —
+        только на коробку-БП.
+        """
+        kinds = ('ps', 'mm') if card.type == 'meas' else ('ps',)
+        boxes = [b for b in self.devices if b.kind in kinds]
+        cb = QtWidgets.QComboBox()
+        for b in boxes:
+            cb.addItem(f'{DEVICE_KIND_TITLES[b.kind]} · {device_title(b, self.devices)}', b.id)
+        i = cb.findData(card.params.get('device', ''))
+        if i >= 0:
+            cb.setCurrentIndex(i)
+
+        def on_change(_i):
+            box_id = cb.currentData()
+            if not box_id:
+                return
+            card.params['device'] = box_id
+            if card.type == 'meas':
+                # режимы Meas зависят от типа прибора: пересобираем настройки
+                box = find_box(self.devices, box_id)
+                valid = [v for v, _ in meas_kind_options(box.kind if box else 'ps')]
+                if card.params.get('kind') not in valid:
+                    card.params['kind'] = valid[0]
+                self.rebuild_params()
+            v = self.views.get(card.id)
+            if v is not None:
+                v.refresh_body()
+
+        cb.currentIndexChanged.connect(on_change)
+        return cb
+
     def _build_card_params(self, card):
         spec = CATALOG[card.type]
-        lab = QtWidgets.QLabel(f'<b>{spec["title"]}</b> · {card_device_label(card)}')
+        lab = QtWidgets.QLabel(f'<b>{spec["title"]}</b> · '
+                               f'{card_device_label(card, self.devices)}')
         lab.setWordWrap(True)
         self.params_lay.addWidget(lab)
         is_meas = card.type == 'meas'
-        device = card.params.get('device', 'ps') if is_meas else 'ps'
+        box = find_box(self.devices, card.params.get('device', ''))
+        box_kind = box.kind if box is not None else 'ps'
         form = QtWidgets.QFormLayout()
+        # коробка-прибор: карта привязана к своей коробке, можно перепривязать
+        if card.type in DEVICE_CARD_TYPES:
+            form.addRow('Прибор', self._device_combo(card))
         for f in spec['fields']:
             key = f['key']
             if is_meas and key == 'kind':
                 continue                      # режим добавим отдельно (зависит от прибора)
             if is_meas and key == 'device':
-                continue        # прибор фиксирован стопкой колоды, не меняется
-            if is_meas and key == 'channel' and device != 'ps':
+                continue        # прибор выбирается списком коробок выше
+            if is_meas and key == 'channel' and box_kind != 'ps':
                 continue                      # канал есть только у БП
             if f.get('options'):
                 cb = QtWidgets.QComboBox()
@@ -2267,9 +2800,9 @@ class MainWindow(QtWidgets.QMainWindow):
                 cb = self._value_editor(card, key, f['default'], extra)
                 form.addRow(f['label'], cb)
         if is_meas:
-            # режим Meas — опции зависят от выбранного прибора
+            # режим Meas — опции зависят от типа прибора коробки
             cb = QtWidgets.QComboBox()
-            for val, lab_opt in meas_kind_options(device):
+            for val, lab_opt in meas_kind_options(box_kind):
                 cb.addItem(lab_opt, val)
             cb.setCurrentIndex(max(0, cb.findData(str(card.params.get('kind', 'voltage')))))
             cb.currentTextChanged.connect(
@@ -2415,9 +2948,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.params_lay.addLayout(form)
 
         info = QtWidgets.QLabel(
-            'X: ' + (summarize(x_card) if x_card is not None
+            'X: ' + (summarize(x_card, self.devices) if x_card is not None
                      else 'пусто — положите Set-карту')
-            + '\nY: ' + ('; '.join(describe(c) for c in y_cards) or
+            + '\nY: ' + ('; '.join(describe(c, None, self.devices) for c in y_cards) or
                          'пусто — положите Meas-карты (линия на каждую)')
             + f'\nСередина: {len(sweep.mid_cards)} карт (выполняются на каждой точке)')
         info.setWordWrap(True)
@@ -2456,38 +2989,74 @@ class MainWindow(QtWidgets.QMainWindow):
         btn_del.clicked.connect(self.delete_selection)
         self.params_lay.addWidget(btn_del)
 
-    def connection_settings(self):
-        return {
-            'ps': {'model': self.cb_ps.currentText(), 'port': self.ed_ps_port.text()},
-            'mm': {'model': self.cb_mm.currentText(), 'port': self.ed_mm_port.text()},
-        }
+    def _build_device_params(self, box):
+        """Настройки коробки (справа): модель прибора и VISA-адрес."""
+        kind_title = DEVICE_KIND_TITLES.get(box.kind, box.kind)
+        lab = QtWidgets.QLabel(f'<b>Коробка · {kind_title}</b> · '
+                               f'{device_display_name(box)}')
+        lab.setWordWrap(True)
+        self.params_lay.addWidget(lab)
 
-    def apply_settings(self, settings):
-        ps = settings.get('ps', {})
-        mm = settings.get('mm', {})
-        i = self.cb_ps.findText(ps.get('model', ''))
-        if i >= 0:
-            self.cb_ps.setCurrentIndex(i)
-        self.ed_ps_port.setText(ps.get('port', DEFAULT_PS['port']))
-        i = self.cb_mm.findText(mm.get('model', ''))
-        if i >= 0:
-            self.cb_mm.setCurrentIndex(i)
-        self.ed_mm_port.setText(mm.get('port', DEFAULT_MM['port']))
+        form = QtWidgets.QFormLayout()
+        models = PS_MODELS if box.kind == 'ps' else MM_MODELS
+        cb = QtWidgets.QComboBox()
+        cb.addItems(models)
+        if box.model:
+            i = cb.findText(box.model)
+            cb.setCurrentIndex(i if i >= 0 else 0)
+        else:
+            box.model = models[0]
+        cb.currentTextChanged.connect(lambda t, b=box: self._box_model_changed(b, t))
+        form.addRow('Прибор (модель)', cb)
+
+        ed = QtWidgets.QLineEdit(box.port)
+        ed.setPlaceholderText('VISA-адрес (напр. USB0::…::INSTR или test_float)')
+        ed.textEdited.connect(lambda t, b=box: setattr(b, 'port', t))
+        form.addRow('Адрес (порт)', ed)
+        self.params_lay.addLayout(form)
+
+        btn_check = QtWidgets.QPushButton('Проверить (*IDN?)')
+        btn_check.setEnabled(not self.running and box.id not in self._idn_threads)
+        btn_check.clicked.connect(lambda _=False, b=box, bt=btn_check:
+                                  self.check_connection(b, bt))
+        self._check_buttons.append(btn_check)
+        self.params_lay.addWidget(btn_check)
+
+        hint = QtWidgets.QLabel('Карты этой коробки подписаны названием прибора '
+                                '(например «AKIP 2101»). Порт test_float — '
+                                'виртуальный режим без железа.')
+        hint.setWordWrap(True)
+        self.params_lay.addWidget(hint)
+
+        btn_del = QtWidgets.QPushButton('Удалить коробку и её карты')
+        btn_del.setEnabled(not self.running)
+        btn_del.clicked.connect(lambda _=False, b=box: self.delete_box(b))
+        self.params_lay.addWidget(btn_del)
+
+    def _box_model_changed(self, box, model):
+        """Сменилась модель прибора коробки: обновить подписи в колоде и на картах."""
+        box.model = model
+        self.rebuild_deck()
+        for v in self.views.values():
+            v.refresh_body()
+        self.rebuild_params()          # заголовок панели настроек
+
+    def connection_settings(self):
+        """Настройки коробок для запуска: {id коробки: {kind, model, port}}."""
+        return {b.id: {'kind': b.kind, 'model': b.model, 'port': b.port}
+                for b in self.devices}
 
     # ---------------------------------------------------------------- проверка IDN
-    def check_connection(self, group):
-        if self.running or group in self._idn_threads:
+    def check_connection(self, box, btn):
+        """Проверка подключения коробки: connect → *IDN? → disconnect."""
+        if self.running or box.id in self._idn_threads:
             return
-        if group == 'ps':
-            model, port, btn = self.cb_ps.currentText(), self.ed_ps_port.text(), self.btn_ps_check
-        else:
-            model, port, btn = self.cb_mm.currentText(), self.ed_mm_port.text(), self.btn_mm_check
         btn.setEnabled(False)
-        th = IdnThread(group, model, port)
+        th = IdnThread(box.kind, box.model, box.port)
         th.sig_log.connect(self.append_log)
         th.sig_done.connect(lambda _g, _r: btn.setEnabled(True))
-        self._idn_threads[group] = th
-        th.finished.connect(lambda g=group: self._idn_threads.pop(g, None))
+        self._idn_threads[box.id] = th
+        th.finished.connect(lambda b=box: self._idn_threads.pop(b.id, None))
         th.start()
 
     # ---------------------------------------------------------------- запуск
@@ -2517,8 +3086,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.run_btn.setEnabled(not on)
         for b in self.deck_buttons:
             b.setEnabled(not on)
-        self.btn_ps_check.setEnabled(not on)
-        self.btn_mm_check.setEnabled(not on)
+        for b in self._check_buttons:
+            b.setEnabled(not on)
         if on:
             self.status.setText('Выполняется программа…')
         else:
@@ -2541,8 +3110,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if not path:
             return
         try:
-            save_program(path, self.sequence, self.connection_settings(),
-                         self.constants)
+            save_program(path, self.sequence, self.devices, self.constants)
             self.append_log(f'Программа сохранена: {path}', 'ok')
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, 'Сохранение', str(e))
@@ -2556,16 +3124,21 @@ class MainWindow(QtWidgets.QMainWindow):
         if not path:
             return
         try:
-            seq, settings, constants = load_program(path)
+            seq, devices, constants = load_program(path)
+            self.devices = devices
             self.sequence[:] = seq
-            self.apply_settings(settings)
+            self._migrate_device_ids(self.sequence)
             self.constants = constants
-            self._render_constants()
             self.selected = set()
-            self.rebuild_strip()
+            self.selected_box_id = None
+            self.rebuild_deck()
+            self._render_constants()
+            self.rebuild_strip(deal_ids=[it.id for it in self.sequence])
             self.rebuild_params()
             self.update_actions()
-            self.append_log(f'Программа загружена: {path} ({len(self.sequence)} элем.)', 'ok')
+            self.append_log(f'Программа загружена: {path} '
+                            f'({len(self.sequence)} элем., коробок: {len(self.devices)})',
+                            'ok')
         except Exception as e:
             QtWidgets.QMessageBox.critical(self, 'Открытие', f'Не удалось открыть: {e}')
 

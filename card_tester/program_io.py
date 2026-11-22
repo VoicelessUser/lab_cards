@@ -1,12 +1,15 @@
 # -*- coding: utf-8 -*-
 """Сохранение/загрузка программы проверки в JSON.
 
-Карты + настройки подключения + константы. Старые типы карт (до объединения
-Set/Meas в одну карту с выбором режима) мигрируются при загрузке.
+Карты + коробки-приборы + константы (v3). Карты ссылаются на прибор через
+id коробки в params['device']. Старые файлы (v2, «подключение» с одним БП
+и одним ММ) мигрируются: настройки превращаются в две коробки, а карты
+привязываются к ним при загрузке (см. MainWindow._migrate_device_ids).
 """
 import json
 
-from .cards import Card, ForLoop, SweepCard, CATALOG
+from .cards import (Card, ForLoop, SweepCard, CATALOG, DeviceBox,
+                    DEFAULT_PS, DEFAULT_MM)
 
 # миграция карт старых версий -> (новый тип, параметры)
 _LEGACY = {
@@ -33,10 +36,12 @@ _LEGACY = {
 }
 
 
-def save_program(path, sequence, settings, constants=None):
+def save_program(path, sequence, devices, constants=None):
+    """Сохраняет программу: карты, коробки-приборы, константы."""
     data = {
-        'version': 2,
-        'connection': settings,
+        'version': 3,
+        'devices': [{'kind': b.kind, 'model': b.model, 'port': b.port, 'id': b.id}
+                    for b in (devices or [])],
         'constants': [dict(c) for c in (constants or [])],
         'sequence': [_dump(it) for it in sequence],
     }
@@ -95,11 +100,36 @@ def _load(it):
     return card
 
 
+def _devices_from_legacy(connection):
+    """Старый файл (v2): настройки подключения → две коробки (БП и ММ)."""
+    conn = connection if isinstance(connection, dict) else {}
+    ps = conn.get('ps', {}) or {}
+    mm = conn.get('mm', {}) or {}
+    return [
+        DeviceBox(kind='ps',
+                  model=str(ps.get('model') or DEFAULT_PS['model']),
+                  port=str(ps.get('port') or DEFAULT_PS['port'])),
+        DeviceBox(kind='mm',
+                  model=str(mm.get('model') or DEFAULT_MM['model']),
+                  port=str(mm.get('port') or DEFAULT_MM['port'])),
+    ]
+
+
 def load_program(path):
-    """Возвращает (последовательность, настройки подключения, константы)."""
+    """Возвращает (последовательность, коробки-приборы, константы)."""
     with open(path, 'r', encoding='utf-8') as f:
         data = json.load(f)
     sequence = [_load(it) for it in data.get('sequence', [])]
     constants = [{'name': str(c.get('name', '')), 'value': str(c.get('value', ''))}
                  for c in data.get('constants', [])]
-    return sequence, data.get('connection', {}), constants
+    devices = []
+    for d in data.get('devices', []):
+        b = DeviceBox(kind=str(d.get('kind', 'ps')),
+                      model=str(d.get('model', '')),
+                      port=str(d.get('port', '')))
+        if d.get('id'):
+            b.id = str(d['id'])
+        devices.append(b)
+    if not devices:                      # старый файл (v2): подключение → коробки
+        devices = _devices_from_legacy(data.get('connection', {}))
+    return sequence, devices, constants

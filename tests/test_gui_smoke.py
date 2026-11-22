@@ -26,10 +26,15 @@ win = MainWindow()
 win.show()
 app.processEvents()
 
+# без железа: коробки на виртуальные порты (реальные USB-адреса стенда
+# требуют pyusb, которого в тестовом окружении может не быть)
+for b in win.devices:
+    b.port = 'test_float'
+
 # --- 0. колода: стопки по приборам + вертикальные карты ---
-assert [(s.card_type, s.device) for s in win.deck_buttons] == [
+assert [(s.card_type, s.box.kind if s.box else 'sys') for s in win.deck_buttons] == [
     ('set', 'ps'), ('meas', 'ps'), ('on', 'ps'), ('meas', 'mm'), ('delay', 'sys'),
-    ('sweep', 'sweep')]
+    ('sweep', 'sys')]
 assert all(isinstance(s, StackWidget) for s in win.deck_buttons)
 cv = win.views[win.sequence[0].id]
 assert (cv.width(), cv.height()) == (150, 210), 'карта вертикальная, как КК'
@@ -37,10 +42,10 @@ assert (cv.width(), cv.height()) == (150, 210), 'карта вертикальн
 # --- 1. клик по стопкам: карты добавляются; ON автоматически везёт OFF ---
 win.sequence[:] = []
 win.rebuild_strip()
-win.add_card('set')
-win.add_card('meas')
+win.add_card('set', box=win.devices[0])
+win.add_card('meas', box=win.devices[0])
 assert len(win.sequence) == 2
-win.add_card('on')
+win.add_card('on', box=win.devices[0])
 assert len(win.sequence) == 4, 'ON кладётся вместе с OFF'
 assert win.sequence[2].type == 'on' and win.sequence[3].type == 'off'
 win.selected = {win.sequence[2].id, win.sequence[3].id}
@@ -48,15 +53,14 @@ win.anchor_id = win.sequence[2].id
 win.delete_selection()
 assert len(win.sequence) == 2
 
-# --- 2. прибор Meas-карты фиксирован стопкой колоды ---
+# --- 2. прибор Meas-карты привязан к коробке стопки колоды ---
 meas = win.sequence[1]                      # карта из стопки БП
 win.selected = {meas.id}
 win.anchor_id = meas.id
 win.rebuild_params()
-assert meas.params['device'] == 'ps' and meas.params['kind'] == 'voltage'
-assert not hasattr(win, '_meas_device_changed'), 'прибор Meas в GUI не переключается'
-mm_meas = new_card('meas', 'mm')            # из стопки «Мультиметр»
-assert mm_meas.params['device'] == 'mm', 'Meas из ММ — всегда ММ'
+assert meas.params['device'] == win.devices[0].id and meas.params['kind'] == 'voltage'
+mm_meas = new_card('meas', win.devices[1])  # из стопки «Мультиметр»
+assert mm_meas.params['device'] == win.devices[1].id, 'Meas из ММ — всегда ММ'
 assert mm_meas.params['kind'] == 'voltage_dc', mm_meas.params
 
 # --- 2b. подсказки констант в полях Set-карты ---
@@ -125,8 +129,9 @@ assert win.report_dialog.table.columnWidth(2) >= 150, 'ширина колонк
 from card_tester.cards import count_sweeps, sweep_candidates
 win.sequence[:] = []
 win.rebuild_strip()
-set_a, set_b = new_card('set'), new_card('set')
-meas_in, meas_out = new_card('meas'), new_card('meas')
+ps_box = win.devices[0]
+set_a, set_b = new_card('set', ps_box), new_card('set', ps_box)
+meas_in, meas_out = new_card('meas', ps_box), new_card('meas', ps_box)
 inner = ForLoop(mode='sweep', start='1', stop='2', step='1',
                 children=[set_b, meas_in])
 outer = ForLoop(mode='sweep', start='1', stop='2', step='1',
@@ -168,7 +173,7 @@ assert len(pngs3) == 2 and all(os.path.exists(p) for p in pngs3), pngs3
 win.sequence[:] = []
 win.rebuild_strip()
 win.sequence[:] = [ForLoop(mode='sweep', start='1', stop='3', step='1',
-                           children=[new_card('meas')])]   # Meas внутри, Set нет
+                           children=[new_card('meas', ps_box)])]   # Meas внутри, Set нет
 win.rebuild_strip()
 assert count_sweeps(win.sequence) == 0, 'свип без Set-карты не считается свипом'
 win.start_run()
@@ -202,10 +207,11 @@ def find_radio(prefix):
 
 win.sequence[:] = []
 win.rebuild_strip()
-s1, s2, s3 = new_card('set'), new_card('set'), new_card('set')
+s1, s2, s3 = (new_card('set', ps_box), new_card('set', ps_box),
+              new_card('set', ps_box))
 s2.params['channel'] = '2'
 s3.params['channel'] = '3'
-m3 = new_card('meas')
+m3 = new_card('meas', ps_box)
 l3 = ForLoop(mode='sweep', start='1', stop='2', step='1',
              target_id=s1.id, children=[s1, s2, s3, m3])
 l2 = ForLoop(mode='count', start='1', stop='2', step='1', children=[l3])
@@ -258,7 +264,7 @@ win.rebuild_strip()
 
 # --- 4. сохранение/загрузка вложенной программы (константы + новые типы) ---
 path = os.path.join(tempfile.gettempdir(), 'card_tester_smoke.json')
-save_program(path, win.sequence, win.connection_settings(),
+save_program(path, win.sequence, win.devices,
              [{'name': 'Vcc', 'value': '3.3'}])
 seq2, st2, consts = load_program(path)
 outer2 = seq2[0]
@@ -266,7 +272,7 @@ assert outer2.mode == 'sweep' and outer2.children[0].type == 'set'
 inner2 = outer2.children[1]
 assert isinstance(inner2, ForLoop) and inner2.mode == 'sweep', 'цикл в цикле сохранён'
 assert inner2.children[0].type == 'set' and inner2.children[1].type == 'meas'
-assert outer2.children[2].type == 'meas' and outer2.children[2].params['device'] == 'ps'
+assert outer2.children[2].type == 'meas' and outer2.children[2].params['device'] == ps_box.id
 assert outer2.target_id == outer2.children[0].id, 'привязка свипа пережила save/load'
 assert inner2.target_id == inner2.children[0].id
 assert count_sweeps(seq2) == 2
@@ -325,13 +331,14 @@ app.processEvents()
 assert win._mdrag is None
 assert len(win.sequence) == 1 and win.sequence[0].type == 'delay', 'карта выложена на ленту'
 # прибор карты — из стопки, из которой её взяли (драг)
-stack_mm = next(s for s in win.deck_buttons if s.device == 'mm')
-win.begin_new_drag(stack_mm, stack_mm.card_type, g, device=stack_mm.device)
+stack_mm = next(s for s in win.deck_buttons
+                if s.box is not None and s.box.kind == 'mm')
+win.begin_new_drag(stack_mm, stack_mm.card_type, g, box=stack_mm.box)
 win._move_drag(g)
 app.processEvents()
 win._end_drag(g, commit=True)
 meas_dragged = next(c for c in win.sequence if c.type == 'meas')
-assert meas_dragged.params['device'] == 'mm', \
+assert meas_dragged.params['device'] == stack_mm.box.id, \
     'Meas, взятая драгом из стопки Мультиметр, — прибор ММ'
 assert meas_dragged.params['kind'] == 'voltage_dc', \
     'режим сразу корректный для ММ'
@@ -344,8 +351,8 @@ assert len(win.sequence) == 1, 'тестовая Meas удалена'
 # --- 8. цикл в цикле: в чужой цикл вложить можно, в свой — нельзя ---
 win.sequence[:] = []
 win.rebuild_strip()
-win.add_card('set')
-win.add_card('set')
+win.add_card('set', box=win.devices[0])
+win.add_card('set', box=win.devices[0])
 card1 = win.sequence[0]
 win.selected = {card1.id}
 win.anchor_id = card1.id
@@ -380,7 +387,7 @@ assert isinstance(win.sequence[0], ForLoop) \
 # --- 8b. карту можно ВТЯНУТЬ в цикл (тело цикла приоритетнее ленты) ---
 win.sequence[:] = []
 win.rebuild_strip()
-win.add_card('set')
+win.add_card('set', box=win.devices[0])
 win.add_card('delay')
 ids = [it.id for it in win.sequence]
 win.selected = {ids[0]}
@@ -434,7 +441,7 @@ assert win.selected == {loop3.id}, 'клик по жёлтой зоне выде
 # --- 8d. карту с ленты можно «положить в колоду» — удалится ---
 win.sequence[:] = []
 win.rebuild_strip()
-win.add_card('set')
+win.add_card('set', box=win.devices[0])
 win.add_card('delay')
 assert len(win.sequence) == 2
 del_card = win.sequence[1]
@@ -542,7 +549,7 @@ assert win.eventFilter(win._strip_area.viewport(), wheel2) is True
 assert sb.value() < sb.maximum(), 'колесо вверх — лента назад'
 
 # --- 12. ошибки попадают в окно отчёта ---
-win.sequence[:] = [new_card('set')]
+win.sequence[:] = [new_card('set', ps_box)]
 win.rebuild_strip()
 win.sequence[0].params['value'] = 'abc'   # не число — будет ошибка
 win.start_run()
@@ -575,13 +582,13 @@ win.rebuild_strip()
 win.open_dialog()
 assert [it.type for it in win.sequence] == ['set', 'delay'],     '📂 восстанавливает программу (карты)'
 assert win.constants, '📂 восстанавливает константы'
-assert win.connection_settings()['ps']['port'], '📂 восстанавливает подключение'
+assert any(cs['port'] for cs in win.connection_settings().values()), '📂 восстанавливает подключение'
 os.remove(p_save)
 
 # --- 14. свип-карта: жёлтая, три отсека, дроп по правилам отсеков ---
 # дальше гоняем на виртуальных приборах, чтобы не трогать стенд
-win.ed_ps_port.setText('test_float')
-win.ed_mm_port.setText('test_float')
+next(b for b in win.devices if b.kind == 'ps').port = 'test_float'
+next(b for b in win.devices if b.kind == 'mm').port = 'test_float'
 
 from card_tester.main_window import SweepView
 from card_tester.cards import SweepCard, sweep_units
@@ -611,7 +618,7 @@ def drop_into(row, item_id, dx=0):
     app.processEvents()
 
 # Set-карта → в X: принимается
-set_x = new_card('set')
+set_x = new_card('set', ps_box)
 win.sequence.append(set_x)
 win.rebuild_strip()
 drop_into(win.views[sw.id].row_x, set_x.id)
@@ -638,7 +645,8 @@ assert sw.x_cards == [set_x] and set_2 in win.sequence, 'в X только од�
 drop_into(win.views[sw.id].row_y, set_2.id)
 assert sw.y_cards == [] and set_2 in win.sequence, 'Y принимает только Meas'
 # две Meas → в Y, каждая — своя линия (БП и ММ — разные подписи)
-meas_y1, meas_y2 = new_card('meas'), new_card('meas', 'mm')
+mm_box = next(b for b in win.devices if b.kind == 'mm')
+meas_y1, meas_y2 = new_card('meas', ps_box), new_card('meas', mm_box)
 win.sequence += [meas_y1, meas_y2]
 win.rebuild_strip()
 drop_into(win.views[sw.id].row_y, meas_y1.id)
@@ -695,7 +703,7 @@ assert 'задать напряжение = 2 В' in texts14, 'X ведётся 
 
 # --- 16. сохранение/загрузка свип-карты ---
 path = os.path.join(tempfile.gettempdir(), 'card_tester_sweep.json')
-save_program(path, win.sequence, win.connection_settings(), [])
+save_program(path, win.sequence, win.devices, [])
 seq_sw, _st, _c = load_program(path)
 os.remove(path)
 sw2 = seq_sw[0]

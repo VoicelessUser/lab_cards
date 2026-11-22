@@ -7,6 +7,12 @@ Set / Meas / ON-OFF / Delay. Прибор (БП или Мультиметр) в�
 только БП. Карты одного типа — одного цвета; значок и подпись на карте —
 по выбранному прибору.
 
+Коробки-приборы (DeviceBox): каждый набор карт в колоде лежит в СВОЕЙ
+коробке — один прибор со своей моделью и VISA-адресом. Коробок может быть
+несколько, в том числе несколько БП или несколько мультиметров. Карты
+set / meas / on / off хранят id своей коробки в params['device']; подпись
+на карте — название прибора коробки (например «AKIP 2101»), а не «БП»/«ММ».
+
 Цикл ForLoop: «повторить N раз» или «свипирование» — ведёт СВОЮ Set-карту
 (свипируемый параметр). Циклы вкладываются друг в друга — уровни свипирования;
 Set-карты раздаются свипам автоматически: вложенный свип забирает свою карту
@@ -24,6 +30,7 @@ Set-карты раздаются свипам автоматически: вл�
 карта-свип внутрь свипа не кладётся. Диапазон точек (От/До/Шаг) — в настройках
 самой свип-карты; Set-карта отсека X не участвует в раздаче карт циклам-свипам.
 """
+import re
 import uuid
 from dataclasses import dataclass, field
 
@@ -31,11 +38,21 @@ from dataclasses import dataclass, field
 C_SET = '#2f6fd6'     # Set — синий
 C_MEAS = '#1e9e5a'    # Meas — зелёный
 C_SW = '#7a4fd0'      # ON / OFF — фиолетовый
-C_SYS = '#6b7280'     # Delay — серый
+C_SYS = '#F5B301'     # Delay — жёлтый: вся группа «Система» (как Свип)
 C_SWEEP = '#F5B301'   # Свип — жёлтый
 C_LOOP = '#b45309'    # линия вставки
 
 DEVICE_LABELS = {'ps': 'БП', 'mm': 'Мультиметр', 'sys': 'Система'}
+DEVICE_KIND_TITLES = {'ps': 'БП', 'mm': 'Мультиметр'}
+
+# типы карт, привязанные к коробке-прибору (params['device'] = id коробки)
+DEVICE_CARD_TYPES = ('set', 'meas', 'on', 'off')
+
+# приборы стенда по умолчанию (порты определены сканированием VISA, *IDN? отвечает)
+DEFAULT_PS = {'model': 'DP832A',    # Rigol DP832 (прошивка отвечает как DP832A)
+              'port': 'USB0::0x1AB1::0x0E11::DP8B262201226::INSTR'}
+DEFAULT_MM = {'model': 'AKIP2101',  # AKIP-2101/2102-SC
+              'port': 'USB0::0xF4EC::0xEE38::SDM35GBD6R2181::INSTR'}
 
 # options: [(значение, подпись)]; options=None — список зависит от прибора
 CATALOG = {
@@ -90,6 +107,20 @@ _MEAS_KIND_SHORT = {
 
 # Карты, которыми управляет свипирование
 SET_CARD_TYPES = ('set',)
+
+
+@dataclass
+class DeviceBox:
+    """Коробка-прибор в колоде: один набор карт = один прибор.
+
+    kind — тип прибора ('ps' — источник питания, 'mm' — мультиметр);
+    model — модель (выбирается в настройках коробки справа); port —
+    VISA-адрес. Коробок может быть несколько, в т.ч. одного типа.
+    """
+    kind: str
+    model: str = ''
+    port: str = ''
+    id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
 
 
 @dataclass
@@ -171,34 +202,85 @@ def meas_kind_options(device):
     return _MEAS_KINDS.get(device, _MEAS_KINDS['ps'])
 
 
-def new_card(card_type, device=None):
+def device_display_name(box):
+    """Название прибора для подписей: модель с пробелом («AKIP2101» → «AKIP 2101»)."""
+    name = re.sub(r'(?<=[A-Za-zА-Яа-я])(?=\d)', ' ', str(getattr(box, 'model', '')).strip())
+    return name or DEVICE_KIND_TITLES.get(getattr(box, 'kind', ''), '?')
+
+
+def device_title(box, boxes=()):
+    """Подпись прибора среди коробок: одинаковые приборы нумеруются
+    («AKIP 2101 (2)»), чтобы их было различить."""
+    name = device_display_name(box)
+    twins = [b for b in boxes if getattr(b, 'kind', None) == getattr(box, 'kind', None)
+             and device_display_name(b) == name]
+    return f'{name} ({twins.index(box) + 1})' if len(twins) > 1 else name
+
+
+def find_box(boxes, device_id):
+    """Коробка с данным id в списке (или None)."""
+    for b in boxes:
+        if b.id == device_id:
+            return b
+    return None
+
+
+def _card_device_kind(card, boxes=(), kinds=None):
+    """Тип прибора карты ('ps'/'mm') — по коробке (или старой метке 'ps'/'mm').
+
+    kinds — {id коробки: 'ps'/'mm'}: раннер знает типы приборов из настроек,
+    но самих коробок у него нет.
+    """
+    box = find_box(boxes, card.params.get('device', ''))
+    if box is not None:
+        return box.kind
+    dev = card.params.get('device', 'ps')
+    if dev in ('ps', 'mm'):
+        return dev
+    if kinds and kinds.get(dev) in ('ps', 'mm'):
+        return kinds[dev]
+    return 'ps'
+
+
+def new_card(card_type, box=None):
     """Карта с параметрами по умолчанию из каталога.
 
-    device — прибор стопки колоды: у Meas-карты он фиксируется при создании
-    (Meas из «Мультиметра» всегда мультиметр) и в GUI не меняется.
+    box — коробка-прибор стопки колоды: прибор фиксируется при создании
+    (карта из коробки «Мультиметр» всегда ведёт её прибор) и позже меняется
+    списком коробок в настройках карты.
     """
     card = Card(card_type, {f['key']: f['default'] for f in CATALOG[card_type]['fields']})
-    if card_type == 'meas' and device and device != card.params.get('device'):
-        card.params['device'] = device
-        valid = [v for v, _ in meas_kind_options(device)]
-        if card.params.get('kind') not in valid:
-            card.params['kind'] = valid[0]
+    if card_type in DEVICE_CARD_TYPES and box is not None:
+        card.params['device'] = box.id
+        if card_type == 'meas':
+            valid = [v for v, _ in meas_kind_options(box.kind)]
+            if card.params.get('kind') not in valid:
+                card.params['kind'] = valid[0]
     return card
 
 
-def card_device_label(card):
-    """Название прибора для подписи на карте (у Meas — по её настройке)."""
-    if card.type == 'meas':
-        return DEVICE_LABELS[card.params.get('device', 'ps')]
+def card_device_label(card, boxes=()):
+    """Подпись прибора на карте: название прибора коробки («AKIP 2101»).
+
+    Для карт без коробки (старые файлы) — общая подпись «БП»/«Мультиметр».
+    """
     if card.type in ('delay', 'sweep'):
         return DEVICE_LABELS['sys']
-    return DEVICE_LABELS['ps']            # set / on / off — только БП
+    box = find_box(boxes, card.params.get('device', ''))
+    if box is not None:
+        return device_title(box, boxes)
+    dev = card.params.get('device', 'ps')
+    if dev in DEVICE_LABELS:
+        return DEVICE_LABELS[dev]
+    return DEVICE_LABELS['ps']            # set / on / off — источник питания
 
 
-def card_icon(card):
-    """Какой значок рисовать на карте (у Meas — по её настройке)."""
+def card_icon(card, boxes=()):
+    """Какой значок рисовать на карте (у Meas — по типу прибора коробки)."""
+    if card.type in ('delay', 'sweep'):
+        return CATALOG[card.type]['icon']
     if card.type == 'meas':
-        return card.params.get('device', 'ps')
+        return _card_device_kind(card, boxes)
     return CATALOG[card.type]['icon']
 
 
@@ -207,7 +289,7 @@ def card_color(card):
     return CATALOG[card.type]['color']
 
 
-def summarize(card):
+def summarize(card, boxes=()):
     """Краткая подпись параметров на карте."""
     p = card.params
     t = card.type
@@ -215,11 +297,12 @@ def summarize(card):
         k = _MEAS_KIND_SHORT['ps'].get(p.get('kind'), '?')
         return f'ch{p.get("channel", "1")} · {k} = {p.get("value", "")}'
     if t == 'meas':
-        dev = p.get('device', 'ps')
+        dev = _card_device_kind(card, boxes)
         k = _MEAS_KIND_SHORT[dev].get(p.get('kind'), '?')
         if dev == 'ps':
             return f'БП ch{p.get("channel", "1")} · {k}'
-        return f'ММ · {k}'
+        box = find_box(boxes, p.get('device', ''))
+        return f'{device_display_name(box) if box else "ММ"} · {k}'
     if t == 'on':
         return f'ch{p.get("channel", "1")} · {p.get("mode", "safe_on")}'
     if t == 'off':
@@ -229,7 +312,7 @@ def summarize(card):
     return ''
 
 
-def stats_rows(card, vars_=None):
+def stats_rows(card, vars_=None, boxes=()):
     """Строки «параметр — значение» для тёмной панели на карте (как статы)."""
     p = {k: substitute(v, vars_) for k, v in card.params.items()}
     t = card.type
@@ -239,7 +322,7 @@ def stats_rows(card, vars_=None):
         return [('РЕЖИМ', k), ('КАНАЛ', str(p.get('channel', '1'))),
                 ('ЗНАЧЕНИЕ', f'{p.get("value", "")} {unit}')]
     if t == 'meas':
-        if p.get('device', 'ps') == 'mm':
+        if _card_device_kind(card, boxes) == 'mm':
             return [('РЕЖИМ', _MEAS_KIND_SHORT['mm'].get(p.get('kind'), '?'))]
         return [('РЕЖИМ', _MEAS_KIND_SHORT['ps'].get(p.get('kind'), '?')),
                 ('КАНАЛ', str(p.get('channel', '1')))]
@@ -253,8 +336,13 @@ def stats_rows(card, vars_=None):
     return []
 
 
-def describe(card, vars_=None):
-    """Человеческое описание действия для статуса (с подстановкой констант)."""
+def describe(card, vars_=None, boxes=(), kinds=None):
+    """Человеческое описание действия для статуса (с подстановкой констант).
+
+    boxes — коробки-приборы: если переданы, в описании название прибора
+    коробки (например «AKIP 2101»), иначе общие «БП»/«ММ». kinds —
+    {id коробки: 'ps'/'mm'} для случая, когда коробок нет (раннер).
+    """
     if isinstance(card, SweepCard):
         xs, ys = len(card.x_cards), len(card.y_cards)
         return (f'свипирование: {sweep_label(card)} · X: {xs}, Y: {ys}')
@@ -263,20 +351,26 @@ def describe(card, vars_=None):
         return 'свипирование: X — Set-карта (ось X), Y — Meas-карты (ось Y)'
     p = {k: substitute(v, vars_) for k, v in card.params.items()}
     ch = p.get('channel', '?')
+
+    def dev_title():
+        box = find_box(boxes, p.get('device', ''))
+        return device_display_name(box) if box is not None else 'БП'
+
     if t == 'set':
         what = 'напряжение' if p.get('kind') == 'voltage' else 'ток'
         unit = 'В' if p.get('kind') == 'voltage' else 'А'
-        return f'БП ch{ch}: задать {what} = {p.get("value", "?")} {unit}'
+        return f'{dev_title()} ch{ch}: задать {what} = {p.get("value", "?")} {unit}'
     if t == 'meas':
-        if p.get('device', 'ps') == 'mm':
+        if _card_device_kind(card, boxes, kinds) == 'mm':
+            box = find_box(boxes, p.get('device', ''))
             k = _MEAS_KIND_SHORT['mm'].get(p.get('kind'), '?')
-            return f'ММ: измерить {k}'
+            return f'{device_display_name(box) if box else "ММ"}: измерить {k}'
         what = 'напряжение' if p.get('kind') == 'voltage' else 'ток'
-        return f'БП ch{ch}: измерить {what}'
+        return f'{dev_title()} ch{ch}: измерить {what}'
     if t == 'on':
-        return f'БП ch{ch}: включить ({p.get("mode", "safe_on")})'
+        return f'{dev_title()} ch{ch}: включить ({p.get("mode", "safe_on")})'
     if t == 'off':
-        return f'БП ch{ch}: выключить'
+        return f'{dev_title()} ch{ch}: выключить'
     if t == 'delay':
         return f'задержка {p.get("seconds", "?")} с'
     return t
@@ -354,19 +448,17 @@ def expand_on_off_pairs(seq, ids):
     return result
 
 
-def used_groups(seq):
-    """Какие приборы задействованы ('ps'/'mm') — с учётом прибора в Meas-картах."""
+def used_devices(seq):
+    """id коробок-приборов, задействованных в программе (с учётом прибора карт)."""
     g = set()
     for it in seq:
         if isinstance(it, ForLoop):
-            g |= used_groups(it.children)
+            g |= used_devices(it.children)
         elif isinstance(it, SweepCard):
             for _role, lst in sweep_bays(it):
-                g |= used_groups(lst)
-        elif it.type == 'meas':
+                g |= used_devices(lst)
+        elif isinstance(it, Card) and it.type in DEVICE_CARD_TYPES:
             g.add(it.params.get('device', 'ps'))
-        elif it.type in ('set', 'on', 'off'):
-            g.add('ps')
     return g
 
 

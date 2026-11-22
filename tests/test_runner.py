@@ -32,20 +32,20 @@ def on_result(label, text, stamp):
 
 def main():
     settings = {
-        'ps': {'model': 'DP832A', 'port': 'test_float'},
-        'mm': {'model': 'DM3068', 'port': 'test_float'},
+        'ps': {'kind': 'ps', 'model': 'DP832A', 'port': 'test_float'},
+        'mm': {'kind': 'mm', 'model': 'DM3068', 'port': 'test_float'},
     }
     constants = {'Vcc': '3.3'}
 
     # Свип: одна Set-карта внутри — свип ведёт её даже без явного выбора
     sweep_loop = ForLoop(mode='sweep', start='1', stop='3', step='1', children=[
-        Card('set', {'kind': 'voltage', 'channel': '1', 'value': '9.9'}),
+        Card('set', {'device': 'ps', 'kind': 'voltage', 'channel': '1', 'value': '9.9'}),
         Card('delay', {'seconds': '0.2'}),
         Card('meas', {'device': 'ps', 'kind': 'voltage', 'channel': '1'}),
     ])
     # Свип с выбором Set-карты: ведётся только целевая (V), ток не трогается
-    target_card = Card('set', {'kind': 'voltage', 'channel': '1', 'value': '9.9'})
-    other_card = Card('set', {'kind': 'current', 'channel': '2', 'value': '0.25'})
+    target_card = Card('set', {'device': 'ps', 'kind': 'voltage', 'channel': '1', 'value': '9.9'})
+    other_card = Card('set', {'device': 'ps', 'kind': 'current', 'channel': '2', 'value': '0.25'})
     pick_loop = ForLoop(mode='sweep', start='1', stop='2', step='1',
                         target_id=target_card.id, children=[target_card, other_card])
     count_loop = ForLoop(mode='count', count='2', children=[
@@ -53,8 +53,8 @@ def main():
         Card('delay', {'seconds': '0.1'}),
     ])
     sequence = [sweep_loop, pick_loop, count_loop,
-                Card('set', {'kind': 'current', 'channel': '1', 'value': '0.5'}),
-                Card('set', {'kind': 'voltage', 'channel': '3', 'value': 'Vcc'})]
+                Card('set', {'device': 'ps', 'kind': 'current', 'channel': '1', 'value': '0.5'}),
+                Card('set', {'device': 'ps', 'kind': 'voltage', 'channel': '3', 'value': 'Vcc'})]
 
     ok = execute_program(sequence, settings, log, lambda: False,
                          constants, on_meas, on_result)
@@ -90,8 +90,8 @@ def main():
     LOG.clear()
     POINTS.clear()
     RESULTS.clear()
-    set_a, set_b = (Card('set', {'kind': 'voltage', 'channel': '1', 'value': '9.9'}),
-                    Card('set', {'kind': 'voltage', 'channel': '2', 'value': '9.9'}))
+    set_a, set_b = (Card('set', {'device': 'ps', 'kind': 'voltage', 'channel': '1', 'value': '9.9'}),
+                    Card('set', {'device': 'ps', 'kind': 'voltage', 'channel': '2', 'value': '9.9'}))
     inner = ForLoop(mode='sweep', start='1', stop='2', step='1',
                     children=[set_b,
                               Card('meas', {'device': 'ps', 'kind': 'voltage',
@@ -130,9 +130,9 @@ def main():
     LOG.clear()
     POINTS.clear()
     RESULTS.clear()
-    s1 = Card('set', {'kind': 'voltage', 'channel': '1', 'value': '9.9'})
-    s2 = Card('set', {'kind': 'voltage', 'channel': '2', 'value': '9.9'})
-    s3 = Card('set', {'kind': 'voltage', 'channel': '3', 'value': '9.9'})
+    s1 = Card('set', {'device': 'ps', 'kind': 'voltage', 'channel': '1', 'value': '9.9'})
+    s2 = Card('set', {'device': 'ps', 'kind': 'voltage', 'channel': '2', 'value': '9.9'})
+    s3 = Card('set', {'device': 'ps', 'kind': 'voltage', 'channel': '3', 'value': '9.9'})
     m3 = Card('meas', {'device': 'ps', 'kind': 'voltage', 'channel': '1'})
     l3 = ForLoop(mode='sweep', start='1', stop='2', step='1',
                  target_id=s1.id, children=[s1, s2, s3, m3])
@@ -166,11 +166,11 @@ def main():
     POINTS.clear()
     RESULTS.clear()
     sw = SweepCard(start='1', stop='3', step='1')
-    sw.x_cards.append(Card('set', {'kind': 'voltage', 'channel': '1', 'value': '9.9'}))
+    sw.x_cards.append(Card('set', {'device': 'ps', 'kind': 'voltage', 'channel': '1', 'value': '9.9'}))
     sw.mid_cards.append(Card('delay', {'seconds': '0.05'}))
     sw.y_cards += [Card('meas', {'device': 'ps', 'kind': 'voltage', 'channel': '1'}),
                    Card('meas', {'device': 'mm', 'kind': 'voltage_dc'})]
-    loop_set = Card('set', {'kind': 'voltage', 'channel': '2', 'value': '9.9'})
+    loop_set = Card('set', {'device': 'ps', 'kind': 'voltage', 'channel': '2', 'value': '9.9'})
     loop_meas = Card('meas', {'device': 'ps', 'kind': 'voltage', 'channel': '2'})
     sw_seq = [sw, ForLoop(mode='sweep', start='1', stop='2', step='1',
                           children=[loop_set, loop_meas])]
